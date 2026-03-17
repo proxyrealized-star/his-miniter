@@ -1003,4 +1003,719 @@ Welcome <b>{user.first_name}</b>!
             await status_msg.edit_text(
                 final_message,
                 parse_mode=ParseMode.HTML,
-                reply_m
+                reply_markup=reply_markup
+            )
+    
+    async def check_command_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Prompt for username to check"""
+        keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message = """
+<b>🔍 CHECK USERNAME</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+Send a username to check its status:
+
+<b>Example:</b> <code>/check cristiano</code>
+<b>Example:</b> <code>/check @leomessi</code>
+
+Or use the command:
+<code>/check username</code>
+━━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+    
+    async def check_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /check command"""
+        user = update.effective_user
+        
+        if not await self.check_force_join(user.id, context):
+            await self.send_force_join_message(update, context)
+            return
+        
+        args = context.args
+        if not args:
+            await self.check_command_prompt(update, context)
+            return
+        
+        username = args[0].lower().strip().lstrip('@')
+        
+        status_msg = await update.message.reply_text(
+            f"🔍 <b>Checking @{username}...</b>",
+            parse_mode=ParseMode.HTML
+        )
+        
+        try:
+            # Check with retry logic
+            status, details = await self.api_client.check_username(username, retry_count=2)
+            
+            # Format response
+            response = self.format_account_info(username, status, details)
+            response += "\nPowered by @proxyfxc"
+            
+            keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await status_msg.edit_text(
+                response,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in check command: {e}")
+            await status_msg.edit_text(
+                f"❌ <b>Error checking @{username}</b>\n\nPlease try again later.",
+                parse_mode=ParseMode.HTML
+            )
+    
+    async def addwatch_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Prompt for username to add to watchlist"""
+        keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message = """
+<b>➕ ADD TO WATCH LIST</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+Send a username to add to your watch list:
+
+<b>Example:</b> <code>/addwatch cristiano</code>
+<b>Example:</b> <code>/addwatch @leomessi</code>
+
+Or use the command:
+<code>/addwatch username</code>
+━━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+    
+    async def addwatch_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /addwatch command"""
+        user = update.effective_user
+        
+        if not await self.check_force_join(user.id, context):
+            await self.send_force_join_message(update, context)
+            return
+        
+        if not self.has_active_subscription(user.id) and not self.is_admin(user.id):
+            await update.message.reply_text(
+                "❌ <b>Subscription Required</b>\n\nContact an admin to purchase access.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        current_count = len(self.db.get_watchlist(user.id))
+        limit = self.get_user_limit(user.id)
+        
+        if current_count >= limit and limit != float('inf'):
+            await update.message.reply_text(
+                f"❌ <b>Limit Reached</b> ({limit})",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        args = context.args
+        if not args:
+            await self.addwatch_prompt(update, context)
+            return
+        
+        username = args[0].lower().strip().lstrip('@')
+        
+        if username in self.db.get_watchlist(user.id):
+            await update.message.reply_text(
+                f"⚠️ @{username} already in watch list.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        self.db.add_to_watchlist(user.id, username)
+        
+        keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"✅ <b>@{username} added to watch list</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup
+        )
+    
+    async def removewatch_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Prompt for username to remove from watchlist"""
+        user = update.effective_user
+        watchlist = self.db.get_watchlist(user.id)
+        
+        message = """
+<b>➖ REMOVE FROM WATCH LIST</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+Send a username to remove:
+
+<b>Example:</b> <code>/removewatch cristiano</code>
+━━━━━━━━━━━━━━━━━━━━━
+
+<b>Your Watch List:</b>
+"""
+        
+        if watchlist:
+            for username in watchlist[:10]:
+                message += f"• @{username}\n"
+        else:
+            message += "<i>Watch list is empty</i>"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+    
+    async def removewatch_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /removewatch command"""
+        user = update.effective_user
+        
+        if not await self.check_force_join(user.id, context):
+            await self.send_force_join_message(update, context)
+            return
+        
+        args = context.args
+        if not args:
+            await self.removewatch_prompt(update, context)
+            return
+        
+        username = args[0].lower().strip().lstrip('@')
+        
+        if self.db.remove_from_watchlist(user.id, username):
+            await update.message.reply_text(
+                f"✅ @{username} removed from watch list.",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ @{username} not found.",
+                parse_mode=ParseMode.HTML
+            )
+    
+    async def addban_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Prompt for username to add to banlist"""
+        keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message = """
+<b>⛔ ADD TO BAN LIST</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+Send a username to add to ban list:
+
+<b>Example:</b> <code>/addban cristiano</code>
+━━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+    
+    async def addban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /addban command"""
+        user = update.effective_user
+        
+        if not await self.check_force_join(user.id, context):
+            await self.send_force_join_message(update, context)
+            return
+        
+        if not self.has_active_subscription(user.id) and not self.is_admin(user.id):
+            await update.message.reply_text(
+                "❌ Subscription Required",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        args = context.args
+        if not args:
+            await self.addban_prompt(update, context)
+            return
+        
+        username = args[0].lower().strip().lstrip('@')
+        
+        if username in self.db.get_banlist(user.id):
+            await update.message.reply_text(
+                f"⚠️ @{username} already in ban list.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        self.db.add_to_banlist(user.id, username)
+        
+        await update.message.reply_text(
+            f"✅ @{username} added to ban list.",
+            parse_mode=ParseMode.HTML
+        )
+    
+    async def removeban_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Prompt for username to remove from banlist"""
+        user = update.effective_user
+        banlist = self.db.get_banlist(user.id)
+        
+        message = """
+<b>✅ REMOVE FROM BAN LIST</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+Send a username to remove:
+
+<b>Example:</b> <code>/removeban cristiano</code>
+━━━━━━━━━━━━━━━━━━━━━
+
+<b>Your Ban List:</b>
+"""
+        
+        if banlist:
+            for username in banlist[:10]:
+                message += f"• @{username}\n"
+        else:
+            message += "<i>Ban list is empty</i>"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+    
+    async def removeban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /removeban command"""
+        user = update.effective_user
+        
+        if not await self.check_force_join(user.id, context):
+            await self.send_force_join_message(update, context)
+            return
+        
+        args = context.args
+        if not args:
+            await self.removeban_prompt(update, context)
+            return
+        
+        username = args[0].lower().strip().lstrip('@')
+        
+        if self.db.remove_from_banlist(user.id, username):
+            await update.message.reply_text(
+                f"✅ @{username} removed from ban list.",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ @{username} not found.",
+                parse_mode=ParseMode.HTML
+            )
+    
+    # ===== ADMIN COMMANDS =====
+    
+    async def approve_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /approve command"""
+        user = update.effective_user
+        
+        if not self.is_admin(user.id):
+            await update.message.reply_text("❌ Admin only command.")
+            return
+        
+        args = context.args
+        if len(args) < 2:
+            await update.message.reply_text(
+                "Usage: /approve [user_id] [days]",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        try:
+            target_id = int(args[0])
+            days = int(args[1])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid numbers.")
+            return
+        
+        expiry_date = datetime.now() + timedelta(days=days)
+        
+        if self.db.update_user(
+            target_id,
+            role='user',
+            subscription_expiry=expiry_date.isoformat(),
+            approved_by=user.id,
+            approved_days=days
+        ):
+            await update.message.reply_text(
+                f"✅ User {target_id} approved for {days} days.",
+                parse_mode=ParseMode.HTML
+            )
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=target_id,
+                    text=f"""
+✅ <b>SUBSCRIPTION APPROVED</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+📅 Duration: {days} days
+⏰ Expires: {expiry_date.strftime('%Y-%m-%d')}
+
+You can now add up to {Config.DEFAULT_USER_LIMIT} usernames.
+━━━━━━━━━━━━━━━━━━━━━
+
+Powered by @proxyfxc
+""",
+                    parse_mode=ParseMode.HTML
+                )
+            except:
+                pass
+    
+    async def addadmin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /addadmin command"""
+        user = update.effective_user
+        
+        if not self.is_owner(user.id):
+            await update.message.reply_text("❌ Owner only command.")
+            return
+        
+        args = context.args
+        if not args:
+            await update.message.reply_text("Usage: /addadmin [user_id]")
+            return
+        
+        try:
+            target_id = int(args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID.")
+            return
+        
+        if self.db.update_user(target_id, role='admin'):
+            await update.message.reply_text(
+                f"✅ User {target_id} is now admin.",
+                parse_mode=ParseMode.HTML
+            )
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=target_id,
+                    text="👑 You are now an admin!",
+                    parse_mode=ParseMode.HTML
+                )
+            except:
+                pass
+    
+    async def broadcast_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /broadcast command"""
+        user = update.effective_user
+        
+        if not self.is_admin(user.id):
+            await update.message.reply_text("❌ Admin only command.")
+            return
+        
+        if not context.args and not update.message.reply_to_message:
+            await update.message.reply_text("Usage: /broadcast [message]")
+            return
+        
+        if update.message.reply_to_message:
+            message = update.message.reply_to_message.text
+        else:
+            message = ' '.join(context.args)
+        
+        status_msg = await update.message.reply_text("📤 Broadcasting...")
+        
+        users = self.db.get_all_users()
+        total = len(users)
+        success = 0
+        
+        for user_id_str in users:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id_str),
+                    text=f"""
+📢 <b>BROADCAST MESSAGE</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+{message}
+━━━━━━━━━━━━━━━━━━━━━
+
+Powered by @proxyfxc
+""",
+                    parse_mode=ParseMode.HTML
+                )
+                success += 1
+                await asyncio.sleep(0.05)
+            except:
+                pass
+        
+        await status_msg.edit_text(
+            f"✅ Broadcast complete: {success}/{total}",
+            parse_mode=ParseMode.HTML
+        )
+    
+    # ===== CALLBACK HANDLER - ALL BUTTONS WORKING =====
+    
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle all button callbacks"""
+        query = update.callback_query
+        await query.answer()
+        
+        user = update.effective_user
+        data = query.data
+        
+        logger.info(f"Button clicked: {data} by user {user.id}")
+        
+        # Handle verify join button
+        if data == "verify_join":
+            await query.edit_message_text(
+                "🔄 <b>Verifying your channel membership...</b>",
+                parse_mode=ParseMode.HTML
+            )
+            
+            if await self.check_force_join(user.id, context):
+                # Success - show main menu
+                await self.show_main_menu(update, context)
+            else:
+                # Failed - show channel button again
+                channel = Config.FORCE_JOIN_CHANNEL
+                keyboard = [
+                    [InlineKeyboardButton(
+                        text=f"📢 Join @proxydominates",
+                        url=channel['url']
+                    )],
+                    [InlineKeyboardButton(
+                        text="🔄 Try Again",
+                        callback_data="verify_join"
+                    )]
+                ]
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    "❌ <b>Verification Failed</b>\n\nPlease join the channel and try again.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup
+                )
+            return
+        
+        # Check force join for all other actions
+        if not await self.check_force_join(user.id, context):
+            await self.send_force_join_message(update, context)
+            return
+        
+        # Handle all menu buttons
+        if data == "menu_main":
+            await self.show_main_menu(update, context)
+        
+        elif data == "menu_watch":
+            await self.watch_command(update, context)
+        
+        elif data == "menu_ban":
+            await self.ban_command(update, context)
+        
+        elif data == "menu_status":
+            await self.status_command(update, context)
+        
+        elif data == "menu_check":
+            await self.check_command_prompt(update, context)
+        
+        elif data == "menu_addwatch":
+            await self.addwatch_prompt(update, context)
+        
+        elif data == "menu_removewatch":
+            await self.removewatch_prompt(update, context)
+        
+        elif data == "menu_addban":
+            await self.addban_prompt(update, context)
+        
+        elif data == "menu_removeban":
+            await self.removeban_prompt(update, context)
+        
+        elif data == "menu_help":
+            help_text = """
+<b>📚 HELP & SUPPORT</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>📌 Commands:</b>
+/watch - View watch list
+/ban - View ban list
+/status - Check all watchlist accounts
+/check [user] - Check single username
+/addwatch [user] - Add to watch
+/removewatch [user] - Remove from watch
+/addban [user] - Add to ban list
+/removeban [user] - Remove from ban list
+
+<b>⚙️ Admin Commands:</b>
+/approve [id] [days]
+/broadcast [message]
+/addadmin [id]
+
+<b>📊 How It Works:</b>
+• 5-minute monitoring
+• 3 confirmations for alerts
+• Auto move between lists
+• Real-time notifications
+━━━━━━━━━━━━━━━━━━━━━
+
+<i>Powered by @proxyfxc</i>
+"""
+            keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                help_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+        
+        elif data == "menu_admin" and self.is_admin(user.id):
+            admin_text = f"""
+<b>⚙️ ADMIN PANEL</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+📊 <b>System Stats:</b>
+• Users: {len(self.db.get_all_users())}
+• Watchlist: {sum(len(items) for items in self.db.watchlist.values())}
+• Banlist: {sum(len(items) for items in self.db.banlist.values())}
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>Commands:</b>
+/approve [user_id] [days]
+/broadcast [message]
+/addadmin [user_id]
+
+Powered by @proxyfxc
+"""
+            keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                admin_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+
+
+# ==================== ERROR HANDLER ====================
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Update {update} caused error {context.error}")
+
+
+# ==================== MAIN APPLICATION ====================
+
+# Global variables
+db = None
+monitoring_engine = None
+api_client = None
+
+async def run_bot():
+    """Async function to run the bot"""
+    global db, monitoring_engine, api_client
+    
+    try:
+        # Initialize database
+        db = DatabaseManager()
+        
+        # Initialize API client
+        api_client = InstagramAPIClient(Config.API_KEY, Config.API_BASE_URL)
+        
+        # Create application
+        application = (
+            Application.builder()
+            .token(Config.BOT_TOKEN)
+            .concurrent_updates(True)
+            .build()
+        )
+        
+        # Initialize handlers
+        handlers = BotHandlers(db, api_client)
+        
+        # Add command handlers
+        application.add_handler(CommandHandler("start", handlers.start_command))
+        application.add_handler(CommandHandler("watch", handlers.watch_command))
+        application.add_handler(CommandHandler("ban", handlers.ban_command))
+        application.add_handler(CommandHandler("status", handlers.status_command))
+        application.add_handler(CommandHandler("check", handlers.check_command))
+        application.add_handler(CommandHandler("addwatch", handlers.addwatch_command))
+        application.add_handler(CommandHandler("removewatch", handlers.removewatch_command))
+        application.add_handler(CommandHandler("addban", handlers.addban_command))
+        application.add_handler(CommandHandler("removeban", handlers.removeban_command))
+        application.add_handler(CommandHandler("approve", handlers.approve_command))
+        application.add_handler(CommandHandler("addadmin", handlers.addadmin_command))
+        application.add_handler(CommandHandler("broadcast", handlers.broadcast_command))
+        
+        # Add callback query handler
+        application.add_handler(CallbackQueryHandler(handlers.button_callback))
+        
+        # Add error handler
+        application.add_error_handler(error_handler)
+        
+        # Initialize monitoring engine
+        monitoring_engine = MonitoringEngine(db, api_client, application)
+        
+        # Start monitoring
+        asyncio.create_task(monitoring_engine.start())
+        
+        # Start bot
+        logger.info("Starting bot...")
+        
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+        
+        logger.info("Bot is running! Single force join: @proxydominates")
+        
+        # Keep running
+        while True:
+            await asyncio.sleep(3600)
+            
+    except Exception as e:
+        logger.error(f"Error in run_bot: {e}")
+        traceback.print_exc()
+
+def main():
+    """Main entry point"""
+    logger.info("Starting main function...")
+    
+    # Start Flask thread
+    import threading
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask keep-alive started")
+    
+    # Run bot with proper event loop
+    try:
+        asyncio.run(run_bot())
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(run_bot())
+        else:
+            loop.run_until_complete(run_bot())
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
