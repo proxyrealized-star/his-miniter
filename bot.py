@@ -3,7 +3,7 @@ Professional Instagram Username Monitor Bot
 Single Channel Force Join - @proxydominates
 All buttons working, subscription system, monitoring
 Author: @proxyfxc
-Version: 4.1.0 (UPDATED)
+Version: 4.2.0 (UPDATED with Profile Pictures)
 """
 
 import os
@@ -16,10 +16,11 @@ from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 import sys
 import traceback
+import re
 
 # Third-party imports
 from flask import Flask, jsonify
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -40,8 +41,8 @@ class Config:
     
     # Bot Configuration
     BOT_TOKEN = os.getenv('BOT_TOKEN', '7728850256:AAFhVPRzSANY905UESCad1al2RsJtqQDmCw')
-    API_KEY = os.getenv('API_KEY', 'PAID_INSTA_SELL187')
-    API_BASE_URL = os.getenv('API_BASE_URL', 'https://tg-user-id-to-number-4erk.onrender.com/api')
+    API_KEY = 'PAID_INSTA_SELL187'  # Hardcoded API key
+    API_BASE_URL = 'https://tg-user-id-to-number-4erk.onrender.com/api'  # Hardcoded base URL
     
     # Admin Configuration
     OWNER_IDS = [int(id) for id in os.getenv('OWNER_IDS', '7805871651').split(',')]
@@ -58,6 +59,7 @@ class Config:
     # Monitoring Configuration
     CHECK_INTERVAL = 300  # 5 minutes
     CONFIRMATION_THRESHOLD = 3  # 3 confirmations needed
+    STATUS_DELAY = 10  # 10 seconds delay between status checks
     
     # Flask Keep-alive
     FLASK_HOST = '0.0.0.0'
@@ -282,9 +284,9 @@ class DatabaseManager:
 class InstagramAPIClient:
     """Async API client for Instagram username checking"""
     
-    def __init__(self, api_key: str, base_url: str):
-        self.api_key = api_key
-        self.base_url = base_url
+    def __init__(self):
+        self.api_key = Config.API_KEY
+        self.base_url = Config.API_BASE_URL
         self.session = None
     
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -292,68 +294,43 @@ class InstagramAPIClient:
             self.session = aiohttp.ClientSession()
         return self.session
     
-    async def check_username(self, username: str, retry_count: int = 2) -> Tuple[str, Dict]:
+    async def check_username(self, username: str) -> Tuple[str, Dict, str]:
         """
-        Check username with retry logic
-        First attempt: normal
-        If fails: wait 5 seconds and retry
-        If still fails: return BANNED
+        Check username with the hardcoded API
+        Returns: (status, profile_data, profile_pic_url)
         """
-        for attempt in range(retry_count + 1):
-            try:
-                session = await self._get_session()
-                url = f"{self.base_url}/insta={username}"
-                
-                async with session.get(
-                    url,
-                    params={'api_key': self.api_key},
-                    timeout=30
-                ) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        
-                        # Handle API response format
-                        if data.get('error'):
-                            if attempt < retry_count:
-                                logger.info(f"Attempt {attempt + 1} failed for @{username}, retrying in 5 seconds...")
-                                await asyncio.sleep(5)
-                                continue
-                            return 'BANNED', {}
-                        
-                        # Check if profile exists in response
-                        if 'profile' in data:
-                            profile = data['profile']
-                            return 'ACTIVE', profile
-                        elif data.get('is_banned', False) or data.get('status') == 'banned':
-                            return 'BANNED', data.get('data', {})
-                        else:
-                            # No data means account might be banned
-                            if attempt < retry_count:
-                                logger.info(f"Attempt {attempt + 1} returned no data for @{username}, retrying in 5 seconds...")
-                                await asyncio.sleep(5)
-                                continue
-                            return 'BANNED', {}
+        try:
+            session = await self._get_session()
+            # Construct URL with hardcoded API key
+            url = f"{self.base_url}/insta={username}?api_key={self.api_key}"
+            
+            logger.info(f"Checking API: {url}")
+            
+            async with session.get(url, timeout=30) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    logger.info(f"API Response for @{username}: {json.dumps(data)[:200]}...")
+                    
+                    # Check if status is ok and profile exists
+                    if data.get('status') == 'ok' and 'profile' in data:
+                        profile = data['profile']
+                        profile_pic = profile.get('profile_pic_url_hd', '')
+                        return 'ACTIVE', profile, profile_pic
+                    elif data.get('error'):
+                        return 'BANNED', {}, ''
                     else:
-                        if attempt < retry_count:
-                            logger.info(f"Attempt {attempt + 1} failed (HTTP {response.status}) for @{username}, retrying in 5 seconds...")
-                            await asyncio.sleep(5)
-                            continue
-                        return 'BANNED', {}
+                        return 'BANNED', {}, ''
+                else:
+                    logger.error(f"HTTP {response.status} for @{username}")
+                    return 'BANNED', {}, ''
                         
-            except asyncio.TimeoutError:
-                if attempt < retry_count:
-                    logger.info(f"Attempt {attempt + 1} timeout for @{username}, retrying in 5 seconds...")
-                    await asyncio.sleep(5)
-                    continue
-                return 'BANNED', {}
-            except Exception as e:
-                logger.error(f"Error checking username {username} (attempt {attempt + 1}): {e}")
-                if attempt < retry_count:
-                    await asyncio.sleep(5)
-                    continue
-                return 'BANNED', {}
-        
-        return 'BANNED', {}
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout for @{username}")
+            return 'BANNED', {}, ''
+        except Exception as e:
+            logger.error(f"Error checking username {username}: {e}")
+            return 'BANNED', {}, ''
     
     async def close(self):
         if self.session and not self.session.closed:
@@ -439,7 +416,7 @@ class MonitoringEngine:
                 await asyncio.sleep(60)
     
     async def _check_single_username(self, username: str, user_ids: List[int], list_type: str):
-        status, details = await self.api_client.check_username(username)
+        status, details, _ = await self.api_client.check_username(username)
         should_alert, count = self.db.update_confirmation(username, status, details)
         
         if should_alert:
@@ -623,10 +600,31 @@ class BotHandlers:
         
         if status == 'ACTIVE':
             name = details.get('full_name', username)
-            followers = details.get('follower_count', 0)
-            following = details.get('following_count', 0)
-            posts = details.get('media_count', 0)
+            followers = details.get('followers', details.get('follower_count', 0))
+            following = details.get('following', details.get('following_count', 0))
+            posts = details.get('posts', details.get('media_count', 0))
             is_private = details.get('is_private', False)
+            
+            # Convert to int if they're strings
+            try:
+                followers = int(followers)
+            except:
+                pass
+            try:
+                following = int(following)
+            except:
+                pass
+            try:
+                posts = int(posts)
+            except:
+                pass
+            
+            private_text = 'Yes' if is_private else 'No'
+            
+            # Format numbers with commas if they're integers
+            followers_str = f"{followers:,}" if isinstance(followers, int) else str(followers)
+            following_str = f"{following:,}" if isinstance(following, int) else str(following)
+            posts_str = f"{posts:,}" if isinstance(posts, int) else str(posts)
             
             return f"""
 🟢 ACCOUNT ACTIVE
@@ -635,10 +633,10 @@ class BotHandlers:
 Profile: @{username}
 
 👤 Name: {name}
-👥 Followers: {followers:,}
-👤 Following: {following:,}
-📸 Posts: {posts:,}
-🔐 Private: {'Yes' if is_private else 'No'}
+👥 Followers: {followers_str}
+👤 Following: {following_str}
+📸 Posts: {posts_str}
+🔐 Private: {private_text}
 
 🟢 ACCOUNT ACTIVE
 
@@ -933,7 +931,7 @@ Welcome <b>{user.first_name}</b>!
             )
     
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show user status and check all watchlist accounts"""
+        """Show user status and check all watchlist accounts with 10-second delays"""
         user = update.effective_user
         
         if not await self.check_force_join(user.id, context):
@@ -955,31 +953,63 @@ Welcome <b>{user.first_name}</b>!
         
         # Send initial status message
         status_msg = await update.message.reply_text(
-            f"🔄 <b>Checking {len(watchlist)} accounts...</b>",
+            f"🔄 <b>Checking {len(watchlist)} accounts with 10-second delays...</b>\n\nThis will take approximately {len(watchlist) * 10} seconds.",
             parse_mode=ParseMode.HTML
         )
         
-        results = []
+        all_results = []
+        success_count = 0
+        banned_count = 0
+        current = 0
         
         for username in watchlist:
+            current += 1
             try:
-                # Check username with retry logic (2 retries, 5 second wait)
-                status, details = await self.api_client.check_username(username, retry_count=2)
+                # Update progress
+                await status_msg.edit_text(
+                    f"🔄 <b>Checking accounts... ({current}/{len(watchlist)})</b>\n\n"
+                    f"Currently checking: @{username}\n"
+                    f"⏱️ Estimated time remaining: {(len(watchlist) - current) * 10} seconds",
+                    parse_mode=ParseMode.HTML
+                )
+                
+                # Check username
+                status, details, profile_pic = await self.api_client.check_username(username)
+                
+                if status == 'ACTIVE':
+                    success_count += 1
+                elif status == 'BANNED':
+                    banned_count += 1
                 
                 # Format the result
                 result = self.format_account_info(username, status, details)
-                results.append(result)
+                result += f"\n━━━━━━━━━━━━━━━━━━━━━\n"
+                all_results.append(result)
                 
-                # Small delay between checks
-                await asyncio.sleep(1)
+                # 10-second delay between checks (except for last one)
+                if current < len(watchlist):
+                    await asyncio.sleep(Config.STATUS_DELAY)
                 
             except Exception as e:
                 logger.error(f"Error checking {username}: {e}")
-                results.append(self.format_account_info(username, 'UNKNOWN', {}))
+                all_results.append(self.format_account_info(username, 'UNKNOWN', {}))
+                all_results.append(f"\n━━━━━━━━━━━━━━━━━━━━━\n")
         
         # Combine all results
-        final_message = "\n".join(results)
-        final_message += "\n\nPowered by @proxyfxc"
+        header = f"""
+<b>📊 STATUS CHECK RESULTS</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+📋 Total: {len(watchlist)}
+🟢 Active: {success_count}
+🔴 Banned: {banned_count}
+❓ Unknown: {len(watchlist) - success_count - banned_count}
+━━━━━━━━━━━━━━━━━━━━━
+
+"""
+        
+        final_message = header + "\n".join(all_results)
+        final_message += "\nPowered by @proxyfxc"
         
         keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -991,7 +1021,7 @@ Welcome <b>{user.first_name}</b>!
             
             parts = [final_message[i:i+4096] for i in range(0, len(final_message), 4096)]
             for i, part in enumerate(parts):
-                if i == len(parts) - 1:
+                if i == 0:
                     await update.message.reply_text(
                         part,
                         parse_mode=ParseMode.HTML,
@@ -1033,7 +1063,7 @@ Or use the command:
             )
     
     async def check_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /check command"""
+        """Handle /check command with profile picture"""
         user = update.effective_user
         
         if not await self.check_force_join(user.id, context):
@@ -1053,18 +1083,43 @@ Or use the command:
         )
         
         try:
-            # Check with retry logic
-            status, details = await self.api_client.check_username(username, retry_count=2)
+            # Check username
+            status, details, profile_pic = await self.api_client.check_username(username)
             
             # Format response
-            response = self.format_account_info(username, status, details)
-            response += "\nPowered by @proxyfxc"
+            response_text = self.format_account_info(username, status, details)
+            response_text += "\nPowered by @proxyfxc"
             
+            # Send with profile picture if available
+            if status == 'ACTIVE' and profile_pic:
+                try:
+                    # Download the profile picture
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(profile_pic) as resp:
+                            if resp.status == 200:
+                                photo_data = await resp.read()
+                                
+                                # Send photo with caption
+                                await status_msg.delete()
+                                await update.message.reply_photo(
+                                    photo=photo_data,
+                                    caption=response_text,
+                                    parse_mode=ParseMode.HTML,
+                                    reply_markup=InlineKeyboardMarkup([[
+                                        InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")
+                                    ]])
+                                )
+                                return
+                except Exception as e:
+                    logger.error(f"Error downloading profile picture: {e}")
+                    # Fall back to text message
+            
+            # If no profile picture or download failed, send text message
             keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             await status_msg.edit_text(
-                response,
+                response_text,
                 parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup
             )
@@ -1634,8 +1689,8 @@ async def run_bot():
         # Initialize database
         db = DatabaseManager()
         
-        # Initialize API client
-        api_client = InstagramAPIClient(Config.API_KEY, Config.API_BASE_URL)
+        # Initialize API client (no need for params now)
+        api_client = InstagramAPIClient()
         
         # Create application
         application = (
