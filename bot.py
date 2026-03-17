@@ -1,8 +1,9 @@
 """
 Professional Instagram Username Monitor Bot
-Enterprise-grade Telegram monitoring system with subscription management
+Single Channel Force Join - @proxydominates
+All buttons working, subscription system, monitoring
 Author: @proxyfxc
-Version: 3.0.0 (FINAL FIXED - All buttons working)
+Version: 4.0.0 (FINAL)
 """
 
 import os
@@ -45,20 +46,18 @@ class Config:
     # Admin Configuration
     OWNER_IDS = [int(id) for id in os.getenv('OWNER_IDS', '7805871651').split(',')]
     
-    # Channel Configuration (Force Join) - FIXED FORMAT
-    REQUIRED_CHANNELS = [
-        {'username': '@proxydominates', 'url': 'https://t.me/proxydominates'},
-        {'username': '@esxcrows', 'url': 'https://t.me/esxcrows'},
-        {'username': '@proxyintfiles', 'url': 'https://t.me/proxyintfiles'},
-        {'username': '@nhuDNrfwaaQzM2M1', 'url': 'https://t.me/+nhuDNrfwaaQzM2M1'},
-    ]
+    # SINGLE CHANNEL FORCE JOIN - @proxydominates ONLY
+    FORCE_JOIN_CHANNEL = {
+        'username': '@proxydominates',
+        'url': 'https://t.me/proxydominates'
+    }
     
     # User Limits
     DEFAULT_USER_LIMIT = 20
     
     # Monitoring Configuration
-    CHECK_INTERVAL = 300
-    CONFIRMATION_THRESHOLD = 3
+    CHECK_INTERVAL = 300  # 5 minutes
+    CONFIRMATION_THRESHOLD = 3  # 3 confirmations needed
     
     # Flask Keep-alive
     FLASK_HOST = '0.0.0.0'
@@ -128,6 +127,7 @@ class DatabaseManager:
         self._save_json(self.banlist_file, self.banlist)
         self._save_json(self.confirmations_file, self.confirmations)
     
+    # User Management
     def get_user(self, user_id: int) -> Dict:
         return self.users.get(str(user_id), {})
     
@@ -143,6 +143,7 @@ class DatabaseManager:
                 'joined_date': datetime.now().isoformat(),
                 'approved_by': None,
                 'approved_days': 0,
+                'verified': False,  # For force join
                 'notification_preferences': {
                     'ban_alerts': True,
                     'unban_alerts': True
@@ -162,6 +163,7 @@ class DatabaseManager:
     def get_all_users(self) -> Dict:
         return self.users
     
+    # Watchlist Management
     def get_watchlist(self, user_id: int) -> List[str]:
         return self.watchlist.get(str(user_id), [])
     
@@ -197,6 +199,7 @@ class DatabaseManager:
                 return True
         return False
     
+    # Banlist Management
     def get_banlist(self, user_id: int) -> List[str]:
         return self.banlist.get(str(user_id), [])
     
@@ -232,6 +235,7 @@ class DatabaseManager:
                 return True
         return False
     
+    # Confirmation Management
     def update_confirmation(self, username: str, status: str, details: Dict = None) -> Tuple[bool, int]:
         username = username.lower().strip().lstrip('@')
         
@@ -271,13 +275,6 @@ class DatabaseManager:
         conf['details'] = details or {}
         self.save_all()
         return False, 1
-    
-    def reset_confirmation(self, username: str):
-        username = username.lower().strip().lstrip('@')
-        if username in self.confirmations:
-            self.confirmations[username]['count'] = 0
-            self.confirmations[username]['status'] = None
-            self.save_all()
 
 
 # ==================== API CLIENT ====================
@@ -363,6 +360,7 @@ class MonitoringEngine:
                 
                 usernames_to_check = {}
                 
+                # Add watchlist items
                 for user_id_str, usernames in self.db.watchlist.items():
                     for username in usernames:
                         if username not in usernames_to_check:
@@ -372,6 +370,7 @@ class MonitoringEngine:
                             }
                         usernames_to_check[username]['user_ids'].append(int(user_id_str))
                 
+                # Add banlist items
                 for user_id_str, usernames in self.db.banlist.items():
                     for username in usernames:
                         if username not in usernames_to_check:
@@ -381,6 +380,7 @@ class MonitoringEngine:
                             }
                         usernames_to_check[username]['user_ids'].append(int(user_id_str))
                 
+                # Check each username
                 for username, info in usernames_to_check.items():
                     try:
                         await self._check_single_username(username, info['user_ids'], info['list_type'])
@@ -443,7 +443,7 @@ class MonitoringEngine:
                 parse_mode=ParseMode.HTML
             )
         except Exception as e:
-            logger.error(f"Failed to send ban alert to {user_id}: {e}")
+            logger.error(f"Failed to send ban alert: {e}")
     
     async def _send_unban_alert(self, user_id: int, username: str, details: Dict):
         try:
@@ -454,7 +454,7 @@ class MonitoringEngine:
                 parse_mode=ParseMode.HTML
             )
         except Exception as e:
-            logger.error(f"Failed to send unban alert to {user_id}: {e}")
+            logger.error(f"Failed to send unban alert: {e}")
     
     def _format_ban_alert(self, username: str, details: Dict) -> str:
         name = details.get('full_name', username)
@@ -580,91 +580,75 @@ class BotHandlers:
             return float('inf')
         return Config.DEFAULT_USER_LIMIT
     
-    # ===== FIXED CHANNEL VERIFICATION =====
+    # ===== SINGLE CHANNEL FORCE JOIN - @proxydominates ONLY =====
     
     async def check_force_join(self, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-        """Check if user has joined required channels - FIXED VERSION"""
+        """Check if user has joined @proxydominates"""
         try:
-            logger.info(f"Checking force join for user {user_id}")
+            # Check if already verified
+            user_data = self.db.get_user(user_id)
+            if user_data.get('verified', False):
+                return True
             
-            for channel in Config.REQUIRED_CHANNELS:
-                channel_username = channel['username']
+            channel = Config.FORCE_JOIN_CHANNEL
+            channel_username = channel['username']
+            
+            # Ensure @ is present
+            if not channel_username.startswith('@'):
+                channel_username = '@' + channel_username
+            
+            # Get chat member
+            member = await context.bot.get_chat_member(
+                chat_id=channel_username,
+                user_id=user_id
+            )
+            
+            # Check if user is member, admin, or creator
+            if member.status in ['member', 'administrator', 'creator']:
+                # Mark as verified
+                self.db.update_user(user_id, verified=True)
+                return True
+            else:
+                return False
                 
-                try:
-                    # Ensure @ is present for public channels
-                    if isinstance(channel_username, str) and not channel_username.startswith('@'):
-                        channel_username = '@' + channel_username
-                    
-                    # Get chat member
-                    member = await context.bot.get_chat_member(
-                        chat_id=channel_username,
-                        user_id=user_id
-                    )
-                    
-                    logger.info(f"User {user_id} status in {channel_username}: {member.status}")
-                    
-                    # Check if user is member, admin, or creator
-                    if member.status in ['left', 'kicked', 'banned']:
-                        logger.info(f"User {user_id} not in channel {channel_username}")
-                        return False
-                        
-                except Exception as e:
-                    logger.warning(f"Could not verify channel {channel_username}: {e}")
-                    # If bot can't verify, assume user is not in channel
-                    return False
-            
-            logger.info(f"User {user_id} passed all channel checks")
-            return True
-            
         except Exception as e:
-            logger.error(f"Error in check_force_join: {e}")
+            logger.error(f"Error checking force join: {e}")
             return False
     
     async def send_force_join_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send force join message with buttons - FIXED VERSION"""
-        keyboard = []
+        """Send force join message for @proxydominates"""
+        channel = Config.FORCE_JOIN_CHANNEL
         
-        # Add channel buttons
-        for channel in Config.REQUIRED_CHANNELS:
-            button_text = f"📢 Join {channel['username']}"
-            if not channel['username'].startswith('@'):
-                button_text = f"📢 Join Channel"
-            
-            keyboard.append([InlineKeyboardButton(
-                text=button_text,
+        keyboard = [
+            [InlineKeyboardButton(
+                text=f"📢 Join @proxydominates",
                 url=channel['url']
-            )])
-        
-        # Add verify button
-        keyboard.append([InlineKeyboardButton(
-            text="✅ I've Joined All Channels",
-            callback_data="verify_join"
-        )])
-        
-        # Add help button
-        keyboard.append([InlineKeyboardButton(
-            text="❓ Need Help?",
-            callback_data="help_join"
-        )])
+            )],
+            [InlineKeyboardButton(
+                text="✅ I've Joined",
+                callback_data="verify_join"
+            )]
+        ]
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         message = """
 <b>🔒 CHANNEL SUBSCRIPTION REQUIRED</b>
 
-To use this bot, you must join all of our channels first:
+To use this bot, you must join our channel first:
 
 ━━━━━━━━━━━━━━━━━━━━━
+<b>📢 @proxydominates</b>
 • Get latest updates
 • Important announcements
-• Premium features info
+• Premium features
 • Support & Community
 ━━━━━━━━━━━━━━━━━━━━━
 
 <b>Steps:</b>
-1️⃣ Click each channel button above
-2️⃣ Join all channels
-3️⃣ Click "I've Joined All Channels"
+1️⃣ Click the button above
+2️⃣ Join the channel
+3️⃣ Click "I've Joined"
 4️⃣ Bot will start automatically
 
 <i>Powered by @proxyfxc</i>
@@ -680,7 +664,7 @@ To use this bot, you must join all of our channels first:
     # ===== COMMAND HANDLERS =====
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command - FIXED VERSION"""
+        """Handle /start command"""
         user = update.effective_user
         
         # Create or get user
@@ -695,7 +679,7 @@ To use this bot, you must join all of our channels first:
             await self.send_force_join_message(update, context)
             return
         
-        # Send welcome message with main menu
+        # Show main menu
         await self.show_main_menu(update, context)
         
         # Notify owner about new user
@@ -762,7 +746,6 @@ Welcome <b>{user.first_name}</b>!
 <i>Powered by @proxyfxc</i>
 """
         
-        # Check if it's a new message or callback
         if update.callback_query:
             await update.callback_query.edit_message_text(
                 welcome_msg,
@@ -804,7 +787,6 @@ Welcome <b>{user.first_name}</b>!
         
         message += "\n<b>Commands:</b>\n/addwatch username\n/removewatch username"
         
-        # Back button
         keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -847,7 +829,6 @@ Welcome <b>{user.first_name}</b>!
         
         message += "\n<b>Commands:</b>\n/addban username\n/removeban username"
         
-        # Back button
         keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -899,7 +880,6 @@ Welcome <b>{user.first_name}</b>!
 ━━━━━━━━━━━━━━━━━━━━━
 """
         
-        # Back button
         keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -1009,7 +989,6 @@ Or use the command:
 <i>Username may not exist or API unavailable</i>
 """
             
-            # Add back button
             keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -1093,7 +1072,6 @@ Or use the command:
         
         self.db.add_to_watchlist(user.id, username)
         
-        # Back button
         keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -1330,6 +1308,8 @@ Send a username to remove:
 
 You can now add up to {Config.DEFAULT_USER_LIMIT} usernames.
 ━━━━━━━━━━━━━━━━━━━━━
+
+Powered by @proxyfxc
 """,
                     parse_mode=ParseMode.HTML
                 )
@@ -1398,11 +1378,13 @@ You can now add up to {Config.DEFAULT_USER_LIMIT} usernames.
                 await context.bot.send_message(
                     chat_id=int(user_id_str),
                     text=f"""
-📢 <b>BROADCAST</b>
+📢 <b>BROADCAST MESSAGE</b>
 
 ━━━━━━━━━━━━━━━━━━━━━
 {message}
 ━━━━━━━━━━━━━━━━━━━━━
+
+Powered by @proxyfxc
 """,
                     parse_mode=ParseMode.HTML
                 )
@@ -1416,10 +1398,10 @@ You can now add up to {Config.DEFAULT_USER_LIMIT} usernames.
             parse_mode=ParseMode.HTML
         )
     
-    # ===== FIXED CALLBACK HANDLER - ALL BUTTONS WORKING =====
+    # ===== CALLBACK HANDLER - ALL BUTTONS WORKING =====
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle all button callbacks - FIXED VERSION"""
+        """Handle all button callbacks"""
         query = update.callback_query
         await query.answer()
         
@@ -1439,56 +1421,26 @@ You can now add up to {Config.DEFAULT_USER_LIMIT} usernames.
                 # Success - show main menu
                 await self.show_main_menu(update, context)
             else:
-                # Failed - show channels again
-                keyboard = []
-                for channel in Config.REQUIRED_CHANNELS:
-                    keyboard.append([InlineKeyboardButton(
-                        text=f"📢 Join {channel['username']}",
+                # Failed - show channel button again
+                channel = Config.FORCE_JOIN_CHANNEL
+                keyboard = [
+                    [InlineKeyboardButton(
+                        text=f"📢 Join @proxydominates",
                         url=channel['url']
-                    )])
-                
-                keyboard.append([InlineKeyboardButton(
-                    text="🔄 Try Again",
-                    callback_data="verify_join"
-                )])
+                    )],
+                    [InlineKeyboardButton(
+                        text="🔄 Try Again",
+                        callback_data="verify_join"
+                    )]
+                ]
                 
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
                 await query.edit_message_text(
-                    "❌ <b>Verification Failed</b>\n\nPlease join all channels and try again.",
+                    "❌ <b>Verification Failed</b>\n\nPlease join the channel and try again.",
                     parse_mode=ParseMode.HTML,
                     reply_markup=reply_markup
                 )
-            return
-        
-        # Handle help join button
-        if data == "help_join":
-            help_text = """
-<b>❓ NEED HELP JOINING?</b>
-
-━━━━━━━━━━━━━━━━━━━━━
-<b>Steps to join channels:</b>
-
-1️⃣ Click each channel button
-2️⃣ Tap "Join" in the channel
-3️⃣ Return here
-4️⃣ Click "Verify" button
-
-<b>Troubleshooting:</b>
-• Make sure you're not already in the channel
-• If already joined, leave and join again
-• Click "Try Again" after joining
-
-<i>Still having issues? Contact @proxyfxc</i>
-"""
-            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="verify_join")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.edit_message_text(
-                help_text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup
-            )
             return
         
         # Check force join for all other actions
@@ -1577,6 +1529,8 @@ You can now add up to {Config.DEFAULT_USER_LIMIT} usernames.
 /approve [user_id] [days]
 /broadcast [message]
 /addadmin [user_id]
+
+Powered by @proxyfxc
 """
             keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1600,11 +1554,10 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 db = None
 monitoring_engine = None
 api_client = None
-application = None
 
 async def run_bot():
     """Async function to run the bot"""
-    global db, monitoring_engine, api_client, application
+    global db, monitoring_engine, api_client
     
     try:
         # Initialize database
@@ -1660,7 +1613,7 @@ async def run_bot():
             drop_pending_updates=True
         )
         
-        logger.info("Bot is running!")
+        logger.info("Bot is running! Single force join: @proxydominates")
         
         # Keep running
         while True:
@@ -1684,7 +1637,6 @@ def main():
     try:
         asyncio.run(run_bot())
     except RuntimeError:
-        # Handle case where loop is already running
         loop = asyncio.get_event_loop()
         if loop.is_running():
             loop.create_task(run_bot())
