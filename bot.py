@@ -2,7 +2,7 @@
 Professional Instagram Username Monitor Bot
 Enterprise-grade Telegram monitoring system with subscription management
 Author: @proxyfxc
-Version: 2.0.0
+Version: 2.1.0 (Render Fixed)
 """
 
 import os
@@ -18,7 +18,7 @@ import traceback
 
 # Third-party imports
 from flask import Flask, jsonify
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -359,11 +359,10 @@ class InstagramAPIClient:
                     data = await response.json()
                     
                     # Parse response based on API structure
-                    # Assuming API returns something like {"status": "active", "data": {...}}
                     if data.get('error'):
                         return 'UNKNOWN', {}
                     
-                    # Check if account is banned (customize based on actual API response)
+                    # Check if account is banned
                     if data.get('is_banned', False) or data.get('status') == 'banned':
                         return 'BANNED', data.get('data', {})
                     else:
@@ -780,6 +779,7 @@ Welcome <b>{user.first_name}</b>!
 /watch - Manage your watch list
 /ban - Manage your ban list
 /status - View monitoring status
+/check [username] - Check specific account
 /help - Get help & info
 
 <i>Powered by @proxyfxc</i>
@@ -940,6 +940,112 @@ Welcome <b>{user.first_name}</b>!
             message,
             parse_mode=ParseMode.HTML
         )
+    
+    async def check_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /check command - Manually check username status"""
+        user = update.effective_user
+        
+        # Check force join
+        if not await self.check_force_join(user.id, context):
+            await self.send_force_join_message(update, context)
+            return
+        
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "❌ <b>Usage:</b> /check [username]\n\n"
+                "Example: /check cristiano\n"
+                "Example: /check @leomessi",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        username = args[0].lower().strip().lstrip('@')
+        
+        # Send typing indicator
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        
+        # Send initial message
+        status_msg = await update.message.reply_text(
+            f"🔍 <b>Checking @{username}...</b>\n\n"
+            f"⏳ Please wait, fetching profile data...",
+            parse_mode=ParseMode.HTML
+        )
+        
+        try:
+            # Call API to check username
+            status, details = await self.api_client.check_username(username)
+            
+            # Format response based on status
+            if status == 'ACTIVE':
+                name = details.get('full_name', username)
+                followers = details.get('follower_count', 0)
+                following = details.get('following_count', 0)
+                posts = details.get('media_count', 0)
+                is_private = details.get('is_private', False)
+                is_verified = details.get('is_verified', False)
+                
+                response = f"""
+🟢 <b>ACCOUNT ACTIVE / UNBANNED</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+📸 <b>Profile:</b> @{username}
+
+👤 <b>Name:</b> {name}
+{'✅ <b>Verified:</b> Yes' if is_verified else ''}
+👥 <b>Followers:</b> {followers:,}
+👤 <b>Following:</b> {following:,}
+📸 <b>Posts:</b> {posts:,}
+🔐 <b>Private:</b> {'Yes' if is_private else 'No'}
+
+✅ <b>Status:</b> ACTIVE
+━━━━━━━━━━━━━━━━━━━━━
+
+<i>Powered by @proxyfxc</i>
+"""
+            elif status == 'BANNED':
+                response = f"""
+🔴 <b>ACCOUNT BANNED</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+📸 <b>Profile:</b> @{username}
+
+⚠️ <b>Status:</b> BANNED / SUSPENDED
+━━━━━━━━━━━━━━━━━━━━━
+
+<i>This account is currently banned or suspended.</i>
+
+Powered by @proxyfxc
+"""
+            else:
+                response = f"""
+❓ <b>ACCOUNT STATUS UNKNOWN</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+📸 <b>Profile:</b> @{username}
+
+⚠️ <b>Status:</b> UNKNOWN
+━━━━━━━━━━━━━━━━━━━━━
+
+<i>Could not fetch account information. The username may not exist or API is temporarily unavailable.</i>
+
+Powered by @proxyfxc
+"""
+            
+            await status_msg.edit_text(
+                response,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=False
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in check command for {username}: {e}")
+            await status_msg.edit_text(
+                f"❌ <b>Error Checking @{username}</b>\n\n"
+                f"An error occurred while checking this username.\n"
+                f"Please try again later.",
+                parse_mode=ParseMode.HTML
+            )
     
     async def addwatch_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /addwatch command"""
@@ -1336,6 +1442,7 @@ Now you can:
 /watch - Manage your watch list
 /ban - Manage your ban list
 /status - View your account status
+/check [username] - Check specific account
 /help - Show this help message
 
 <b>🔧 Watch List Commands:</b>
@@ -1390,7 +1497,7 @@ Now you can:
             )
 
 
-# ==================== MAIN APPLICATION ====================
+# ==================== ERROR HANDLER ====================
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors gracefully"""
@@ -1406,60 +1513,127 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
+
+# ==================== MAIN APPLICATION WITH RENDER FIX ====================
+
+# Global variables
+db = None
+monitoring_engine = None
+api_client = None
+application = None
+
+async def run_bot():
+    """Async function to run the bot"""
+    global db, monitoring_engine, api_client, application
+    
+    try:
+        # Initialize database
+        db = DatabaseManager()
+        
+        # Initialize API client
+        api_client = InstagramAPIClient(Config.API_KEY, Config.API_BASE_URL)
+        
+        # Create application
+        application = (
+            Application.builder()
+            .token(Config.BOT_TOKEN)
+            .concurrent_updates(True)
+            .build()
+        )
+        
+        # Initialize handlers
+        handlers = BotHandlers(db, api_client)
+        
+        # Add command handlers
+        application.add_handler(CommandHandler("start", handlers.start_command))
+        application.add_handler(CommandHandler("watch", handlers.watch_command))
+        application.add_handler(CommandHandler("ban", handlers.ban_command))
+        application.add_handler(CommandHandler("status", handlers.status_command))
+        application.add_handler(CommandHandler("check", handlers.check_command))
+        application.add_handler(CommandHandler("addwatch", handlers.addwatch_command))
+        application.add_handler(CommandHandler("removewatch", handlers.removewatch_command))
+        application.add_handler(CommandHandler("addban", handlers.addban_command))
+        application.add_handler(CommandHandler("removeban", handlers.removeban_command))
+        application.add_handler(CommandHandler("approve", handlers.approve_command))
+        application.add_handler(CommandHandler("addadmin", handlers.addadmin_command))
+        application.add_handler(CommandHandler("broadcast", handlers.broadcast_command))
+        
+        # Add callback query handler
+        application.add_handler(CallbackQueryHandler(handlers.button_callback))
+        
+        # Add error handler
+        application.add_error_handler(error_handler)
+        
+        # Initialize monitoring engine
+        monitoring_engine = MonitoringEngine(db, api_client, application)
+        
+        # Start monitoring in background
+        asyncio.create_task(monitoring_engine.start())
+        
+        # Start bot
+        logger.info("Starting bot...")
+        
+        # Use run_polling with proper shutdown
+        await application.initialize()
+        await application.start()
+        
+        # Start polling
+        await application.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+        
+        logger.info("Bot is running. Press Ctrl+C to stop.")
+        
+        # Keep running until stopped
+        while True:
+            await asyncio.sleep(3600)  # Sleep for an hour
+            
+    except asyncio.CancelledError:
+        logger.info("Bot task cancelled")
+    except Exception as e:
+        logger.error(f"Error in run_bot: {e}")
+        traceback.print_exc()
+    finally:
+        # Clean shutdown
+        if monitoring_engine:
+            await monitoring_engine.stop()
+        if application:
+            await application.stop()
+            await application.shutdown()
+        if api_client:
+            await api_client.close()
+        logger.info("Bot shutdown complete")
+
 def main():
-    """Main entry point"""
-    global db, monitoring_engine
+    """Main entry point with proper event loop handling for Render"""
+    logger.info("Starting main function...")
     
-    # Initialize database
-    db = DatabaseManager()
-    
-    # Initialize API client
-    api_client = InstagramAPIClient(Config.API_KEY, Config.API_BASE_URL)
-    
-    # Create application
-    application = (
-        Application.builder()
-        .token(Config.BOT_TOKEN)
-        .concurrent_updates(True)
-        .build()
-    )
-    
-    # Initialize handlers
-    handlers = BotHandlers(db, api_client)
-    
-    # Add command handlers
-    application.add_handler(CommandHandler("start", handlers.start_command))
-    application.add_handler(CommandHandler("watch", handlers.watch_command))
-    application.add_handler(CommandHandler("ban", handlers.ban_command))
-    application.add_handler(CommandHandler("status", handlers.status_command))
-    application.add_handler(CommandHandler("addwatch", handlers.addwatch_command))
-    application.add_handler(CommandHandler("removewatch", handlers.removewatch_command))
-    application.add_handler(CommandHandler("addban", handlers.addban_command))
-    application.add_handler(CommandHandler("removeban", handlers.removeban_command))
-    application.add_handler(CommandHandler("approve", handlers.approve_command))
-    application.add_handler(CommandHandler("addadmin", handlers.addadmin_command))
-    application.add_handler(CommandHandler("broadcast", handlers.broadcast_command))
-    
-    # Add callback query handler
-    application.add_handler(CallbackQueryHandler(handlers.button_callback))
-    
-    # Add error handler
-    application.add_error_handler(error_handler)
-    
-    # Initialize and start monitoring engine
-    monitoring_engine = MonitoringEngine(db, api_client, application)
-    
-    # Start monitoring in background
-    asyncio.create_task(monitoring_engine.start())
-    
-    # Start Flask in a separate thread
+    # Start Flask in a separate thread for Render keep-alive
     import threading
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
+    logger.info("Flask keep-alive thread started")
     
-    # Start bot
-    logger.info("Starting bot...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Handle event loop properly
+    try:
+        # Try to get running loop
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Loop is already running (like in Render)
+            logger.info("Event loop already running, creating task")
+            loop.create_task(run_bot())
+        else:
+            # Loop exists but not running
+            logger.info("Event loop exists but not running, running until complete")
+            loop.run_until_complete(run_bot())
+    except RuntimeError:
+        # No event loop, create one
+        logger.info("No event loop found, creating new one")
+        asyncio.run(run_bot())
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
