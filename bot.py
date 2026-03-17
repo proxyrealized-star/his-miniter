@@ -3,7 +3,7 @@ Professional Instagram Username Monitor Bot
 Single Channel Force Join - @proxydominates
 All buttons working, subscription system, monitoring
 Author: @proxyfxc
-Version: 4.2.0 (UPDATED with Profile Pictures)
+Version: 4.4.0 (INSTANT NOTIFICATIONS + ADD DETAILS)
 """
 
 import os
@@ -58,7 +58,6 @@ class Config:
     
     # Monitoring Configuration
     CHECK_INTERVAL = 300  # 5 minutes
-    CONFIRMATION_THRESHOLD = 3  # 3 confirmations needed
     STATUS_DELAY = 10  # 10 seconds delay between status checks
     
     # Flask Keep-alive
@@ -177,16 +176,6 @@ class DatabaseManager:
         username = username.lower().strip().lstrip('@')
         if username not in self.watchlist[str_id]:
             self.watchlist[str_id].append(username)
-            
-            if username not in self.confirmations:
-                self.confirmations[username] = {
-                    'status': None,
-                    'count': 0,
-                    'last_check': None,
-                    'details': {}
-                }
-            
-            self.confirmations[username]['current_list'] = 'watch'
             self.save_all()
             return True
         return False
@@ -213,16 +202,6 @@ class DatabaseManager:
         username = username.lower().strip().lstrip('@')
         if username not in self.banlist[str_id]:
             self.banlist[str_id].append(username)
-            
-            if username not in self.confirmations:
-                self.confirmations[username] = {
-                    'status': None,
-                    'count': 0,
-                    'last_check': None,
-                    'details': {}
-                }
-            
-            self.confirmations[username]['current_list'] = 'ban'
             self.save_all()
             return True
         return False
@@ -236,47 +215,6 @@ class DatabaseManager:
                 self.save_all()
                 return True
         return False
-    
-    # Confirmation Management
-    def update_confirmation(self, username: str, status: str, details: Dict = None) -> Tuple[bool, int]:
-        username = username.lower().strip().lstrip('@')
-        
-        if username not in self.confirmations:
-            self.confirmations[username] = {
-                'status': None,
-                'count': 0,
-                'last_check': None,
-                'details': {}
-            }
-        
-        conf = self.confirmations[username]
-        old_status = conf['status']
-        
-        conf['last_check'] = datetime.now().isoformat()
-        
-        if status == 'UNKNOWN' or (old_status and old_status != status):
-            conf['count'] = 0
-            conf['status'] = status if status != 'UNKNOWN' else None
-            conf['details'] = details or {}
-            self.save_all()
-            return False, 0
-        
-        if old_status == status:
-            conf['count'] += 1
-            conf['details'] = details or {}
-            self.save_all()
-            
-            if conf['count'] >= Config.CONFIRMATION_THRESHOLD:
-                conf['count'] = 0
-                self.save_all()
-                return True, Config.CONFIRMATION_THRESHOLD
-            return False, conf['count']
-        
-        conf['status'] = status
-        conf['count'] = 1
-        conf['details'] = details or {}
-        self.save_all()
-        return False, 1
 
 
 # ==================== API CLIENT ====================
@@ -338,9 +276,10 @@ class InstagramAPIClient:
 
 
 # ==================== MONITORING ENGINE ====================
+# MODIFIED: Instant notifications on single check
 
 class MonitoringEngine:
-    """Background monitoring engine with confirmation system"""
+    """Background monitoring engine with INSTANT notifications"""
     
     def __init__(self, db: DatabaseManager, api_client: InstagramAPIClient, bot_app: Application):
         self.db = db
@@ -348,12 +287,15 @@ class MonitoringEngine:
         self.bot_app = bot_app
         self.is_running = False
         self.task = None
+        
+        # Track last status to detect changes
+        self.last_status = {}
     
     async def start(self):
         if not self.is_running:
             self.is_running = True
             self.task = asyncio.create_task(self._monitoring_loop())
-            logger.info("Monitoring engine started")
+            logger.info("Monitoring engine started - INSTANT NOTIFICATIONS MODE")
     
     async def stop(self):
         self.is_running = False
@@ -371,6 +313,7 @@ class MonitoringEngine:
                 start_time = datetime.now()
                 logger.info("Starting monitoring cycle")
                 
+                # Track all usernames and their users
                 usernames_to_check = {}
                 
                 # Add watchlist items
@@ -416,40 +359,76 @@ class MonitoringEngine:
                 await asyncio.sleep(60)
     
     async def _check_single_username(self, username: str, user_ids: List[int], list_type: str):
-        status, details, _ = await self.api_client.check_username(username)
-        should_alert, count = self.db.update_confirmation(username, status, details)
+        """MODIFIED: Instant notification on status change"""
+        status, details, profile_pic = await self.api_client.check_username(username)
         
-        if should_alert:
-            await self._process_alert(username, user_ids, status, list_type, details)
+        # Get previous status
+        prev_status = self.last_status.get(username)
+        
+        # If status changed and we have previous status
+        if prev_status and prev_status != status:
+            logger.info(f"Status changed for @{username}: {prev_status} -> {status}")
+            
+            # Process alert immediately
+            await self._process_alert(username, user_ids, status, list_type, details, profile_pic)
+        
+        # Update last status
+        self.last_status[username] = status
     
-    async def _process_alert(self, username: str, user_ids: List[int], status: str, list_type: str, details: Dict):
-        current_list = self.db.confirmations.get(username, {}).get('current_list', 'watch')
+    async def _process_alert(self, username: str, user_ids: List[int], status: str, list_type: str, details: Dict, profile_pic: str):
+        """Process alert for all users watching this username"""
         
         for user_id in user_ids:
             try:
                 user_data = self.db.get_user(user_id)
                 
-                if status == 'BANNED' and current_list == 'watch':
+                # Check if this is a ban event (watchlist -> banned)
+                if status == 'BANNED' and list_type == 'watch':
+                    # Move from watchlist to banlist
                     self.db.remove_from_watchlist(user_id, username)
                     self.db.add_to_banlist(user_id, username)
                     
+                    # Send notification if enabled
                     if user_data.get('notification_preferences', {}).get('ban_alerts', True):
-                        await self._send_ban_alert(user_id, username, details)
-                        
-                elif status == 'ACTIVE' and current_list == 'ban':
+                        await self._send_ban_alert(user_id, username, details, profile_pic)
+                
+                # Check if this is an unban event (banlist -> active)
+                elif status == 'ACTIVE' and list_type == 'ban':
+                    # Move from banlist to watchlist
                     self.db.remove_from_banlist(user_id, username)
                     self.db.add_to_watchlist(user_id, username)
                     
+                    # Send notification if enabled
                     if user_data.get('notification_preferences', {}).get('unban_alerts', True):
-                        await self._send_unban_alert(user_id, username, details)
+                        await self._send_unban_alert(user_id, username, details, profile_pic)
                         
             except Exception as e:
                 logger.error(f"Error processing alert for user {user_id}: {e}")
                 continue
     
-    async def _send_ban_alert(self, user_id: int, username: str, details: Dict):
+    async def _send_ban_alert(self, user_id: int, username: str, details: Dict, profile_pic: str):
+        """Send ban alert with profile picture if available"""
         try:
             message = self._format_ban_alert(username, details)
+            
+            # Try to send with profile picture
+            if profile_pic:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(profile_pic) as resp:
+                            if resp.status == 200:
+                                photo_data = await resp.read()
+                                await self.bot_app.bot.send_photo(
+                                    chat_id=user_id,
+                                    photo=photo_data,
+                                    caption=message,
+                                    parse_mode=ParseMode.HTML
+                                )
+                                return
+                except Exception as e:
+                    logger.error(f"Error sending photo: {e}")
+            
+            # Fallback to text message
             await self.bot_app.bot.send_message(
                 chat_id=user_id,
                 text=message,
@@ -458,9 +437,29 @@ class MonitoringEngine:
         except Exception as e:
             logger.error(f"Failed to send ban alert: {e}")
     
-    async def _send_unban_alert(self, user_id: int, username: str, details: Dict):
+    async def _send_unban_alert(self, user_id: int, username: str, details: Dict, profile_pic: str):
+        """Send unban alert with profile picture if available"""
         try:
             message = self._format_unban_alert(username, details)
+            
+            # Try to send with profile picture
+            if profile_pic:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(profile_pic) as resp:
+                            if resp.status == 200:
+                                photo_data = await resp.read()
+                                await self.bot_app.bot.send_photo(
+                                    chat_id=user_id,
+                                    photo=photo_data,
+                                    caption=message,
+                                    parse_mode=ParseMode.HTML
+                                )
+                                return
+                except Exception as e:
+                    logger.error(f"Error sending photo: {e}")
+            
+            # Fallback to text message
             await self.bot_app.bot.send_message(
                 chat_id=user_id,
                 text=message,
@@ -470,57 +469,91 @@ class MonitoringEngine:
             logger.error(f"Failed to send unban alert: {e}")
     
     def _format_ban_alert(self, username: str, details: Dict) -> str:
+        """Format ban alert with profile details"""
         name = details.get('full_name', username)
         followers = details.get('follower_count', 'N/A')
         following = details.get('following_count', 'N/A')
         posts = details.get('media_count', 'N/A')
         is_private = details.get('is_private', False)
         
+        # Format numbers
+        try:
+            followers = f"{int(followers):,}" if followers != 'N/A' else 'N/A'
+        except:
+            followers = str(followers)
+        
+        try:
+            following = f"{int(following):,}" if following != 'N/A' else 'N/A'
+        except:
+            following = str(following)
+        
+        try:
+            posts = f"{int(posts):,}" if posts != 'N/A' else 'N/A'
+        except:
+            posts = str(posts)
+        
         return f"""
-🔴 <b>BANNED ACCOUNT DETECTED</b> 🔴
+🔴 <b>🚨 BANNED ACCOUNT DETECTED</b> 🔴
 
 ━━━━━━━━━━━━━━━━━━━━━
 📸 <b>Profile:</b> @{username}
 
 👤 <b>Name:</b> {name}
-👥 <b>Followers:</b> {followers:,}
-👤 <b>Following:</b> {following:,}
-📸 <b>Posts:</b> {posts:,}
+👥 <b>Followers:</b> {followers}
+👤 <b>Following:</b> {following}
+📸 <b>Posts:</b> {posts}
 🔐 <b>Private:</b> {'Yes' if is_private else 'No'}
 
-⚠️ <b>Status:</b> <code>BANNED</code>
+⚠️ <b>Status:</b> <code>BANNED / SUSPENDED</code>
 ⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 ━━━━━━━━━━━━━━━━━━━━━
-<i>Account moved to Ban List</i>
+<i>Account moved to Ban List automatically</i>
 
 Powered by @proxyfxc
 """
     
     def _format_unban_alert(self, username: str, details: Dict) -> str:
+        """Format unban alert with profile details"""
         name = details.get('full_name', username)
         followers = details.get('follower_count', 'N/A')
         following = details.get('following_count', 'N/A')
         posts = details.get('media_count', 'N/A')
         is_private = details.get('is_private', False)
         
+        # Format numbers
+        try:
+            followers = f"{int(followers):,}" if followers != 'N/A' else 'N/A'
+        except:
+            followers = str(followers)
+        
+        try:
+            following = f"{int(following):,}" if following != 'N/A' else 'N/A'
+        except:
+            following = str(following)
+        
+        try:
+            posts = f"{int(posts):,}" if posts != 'N/A' else 'N/A'
+        except:
+            posts = str(posts)
+        
         return f"""
-🟢 <b>ACCOUNT UNBANNED</b> 🟢
+🟢 <b>✅ ACCOUNT UNBANNED</b> 🟢
 
 ━━━━━━━━━━━━━━━━━━━━━
 📸 <b>Profile:</b> @{username}
 
 👤 <b>Name:</b> {name}
-👥 <b>Followers:</b> {followers:,}
-👤 <b>Following:</b> {following:,}
-📸 <b>Posts:</b> {posts:,}
+👥 <b>Followers:</b> {followers}
+👤 <b>Following:</b> {following}
+📸 <b>Posts:</b> {posts}
 🔐 <b>Private:</b> {'Yes' if is_private else 'No'}
 
-✅ <b>Status:</b> <code>ACTIVE</code>
+✅ <b>Status:</b> <code>ACTIVE / RESTORED</code>
 ⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 ━━━━━━━━━━━━━━━━━━━━━
-<i>Account moved to Watch List</i>
+<i>Account moved back to Watch List automatically</i>
 
 Powered by @proxyfxc
 """
@@ -662,6 +695,96 @@ Profile: @{username}
 
 ⚠️ Status: UNKNOWN / NOT FOUND
 
+━━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    # ===== FORMAT ADD WATCH DETAILS =====
+    
+    def format_add_watch_details(self, username: str, status: str, details: Dict, current_count: int, limit: Any) -> str:
+        """Format detailed message when adding to watchlist"""
+        
+        if status == 'ACTIVE':
+            name = details.get('full_name', username)
+            followers = details.get('followers', details.get('follower_count', 0))
+            following = details.get('following', details.get('following_count', 0))
+            posts = details.get('posts', details.get('media_count', 0))
+            is_private = details.get('is_private', False)
+            
+            # Convert to int if they're strings
+            try:
+                followers = int(followers)
+            except:
+                pass
+            try:
+                following = int(following)
+            except:
+                pass
+            try:
+                posts = int(posts)
+            except:
+                pass
+            
+            private_text = 'Yes' if is_private else 'No'
+            
+            # Format numbers with commas if they're integers
+            followers_str = f"{followers:,}" if isinstance(followers, int) else str(followers)
+            following_str = f"{following:,}" if isinstance(following, int) else str(following)
+            posts_str = f"{posts:,}" if isinstance(posts, int) else str(posts)
+            
+            limit_text = f"{current_count}/{limit}" if limit != float('inf') else f"{current_count}/∞"
+            
+            return f"""
+✅ <b>ACCOUNT ADDED TO WATCH LIST</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+📸 <b>Profile:</b> @{username}
+
+👤 <b>Name:</b> {name}
+👥 <b>Followers:</b> {followers_str}
+👤 <b>Following:</b> {following_str}
+📸 <b>Posts:</b> {posts_str}
+🔐 <b>Private:</b> {private_text}
+🟢 <b>Status:</b> ACTIVE
+
+━━━━━━━━━━━━━━━━━━━━━
+📊 <b>Watch List:</b> {limit_text}
+
+<i>You will be notified when status changes</i>
+━━━━━━━━━━━━━━━━━━━━━
+"""
+        elif status == 'BANNED':
+            limit_text = f"{current_count}/{limit}" if limit != float('inf') else f"{current_count}/∞"
+            
+            return f"""
+⚠️ <b>ACCOUNT ADDED TO WATCH LIST</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+📸 <b>Profile:</b> @{username}
+
+🔴 <b>Status:</b> BANNED / SUSPENDED
+⚠️ <b>Note:</b> Account is currently banned
+
+━━━━━━━━━━━━━━━━━━━━━
+📊 <b>Watch List:</b> {limit_text}
+
+<i>You will be notified when unbanned</i>
+━━━━━━━━━━━━━━━━━━━━━
+"""
+        else:
+            limit_text = f"{current_count}/{limit}" if limit != float('inf') else f"{current_count}/∞"
+            
+            return f"""
+❓ <b>ACCOUNT ADDED TO WATCH LIST</b>
+
+━━━━━━━━━━━━━━━━━━━━━
+📸 <b>Profile:</b> @{username}
+
+❓ <b>Status:</b> UNKNOWN / NOT FOUND
+
+━━━━━━━━━━━━━━━━━━━━━
+📊 <b>Watch List:</b> {limit_text}
+
+<i>You will be notified if account becomes active</i>
 ━━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -1157,8 +1280,10 @@ Or use the command:
                 reply_markup=reply_markup
             )
     
+    # ===== MODIFIED ADDWATCH COMMAND WITH DETAILS =====
+    
     async def addwatch_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /addwatch command"""
+        """Handle /addwatch command with detailed response"""
         user = update.effective_user
         
         if not await self.check_force_join(user.id, context):
@@ -1190,19 +1315,68 @@ Or use the command:
         username = args[0].lower().strip().lstrip('@')
         
         if username in self.db.get_watchlist(user.id):
-            await update.message.reply_text(
-                f"⚠️ @{username} already in watch list.",
+            # Already in watchlist - show current status
+            status_msg = await update.message.reply_text(
+                f"🔍 <b>Checking @{username}...</b>",
                 parse_mode=ParseMode.HTML
+            )
+            
+            status, details, profile_pic = await self.api_client.check_username(username)
+            
+            response_text = self.format_account_info(username, status, details)
+            response_text += "\n⚠️ <i>Already in your watch list</i>\nPowered by @proxyfxc"
+            
+            keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await status_msg.edit_text(
+                response_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
             )
             return
         
+        # Add to watchlist
         self.db.add_to_watchlist(user.id, username)
+        
+        # Show checking message
+        status_msg = await update.message.reply_text(
+            f"🔍 <b>Fetching details for @{username}...</b>",
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Get current status
+        status, details, profile_pic = await self.api_client.check_username(username)
+        
+        # Format detailed response
+        new_count = current_count + 1
+        response_text = self.format_add_watch_details(username, status, details, new_count, limit)
         
         keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await update.message.reply_text(
-            f"✅ <b>@{username} added to watch list</b>",
+        # Send with profile picture if available
+        if status == 'ACTIVE' and profile_pic:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(profile_pic) as resp:
+                        if resp.status == 200:
+                            photo_data = await resp.read()
+                            
+                            await status_msg.delete()
+                            await update.message.reply_photo(
+                                photo=photo_data,
+                                caption=response_text,
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=reply_markup
+                            )
+                            return
+            except Exception as e:
+                logger.error(f"Error downloading profile picture: {e}")
+        
+        # Fallback to text message
+        await status_msg.edit_text(
+            response_text,
             parse_mode=ParseMode.HTML,
             reply_markup=reply_markup
         )
@@ -1612,7 +1786,7 @@ Powered by @proxyfxc
 /ban - View ban list
 /status - Check all watchlist accounts
 /check [user] - Check single username
-/addwatch [user] - Add to watch
+/addwatch [user] - Add to watch (with details)
 /removewatch [user] - Remove from watch
 /addban [user] - Add to ban list
 /removeban [user] - Remove from ban list
@@ -1624,9 +1798,10 @@ Powered by @proxyfxc
 
 <b>📊 How It Works:</b>
 • 5-minute monitoring
-• 3 confirmations for alerts
+• INSTANT notifications on status change
 • Auto move between lists
-• Real-time notifications
+• Profile pictures in alerts
+• Detailed info when adding accounts
 ━━━━━━━━━━━━━━━━━━━━━
 
 <i>Powered by @proxyfxc</i>
@@ -1649,6 +1824,7 @@ Powered by @proxyfxc
 • Users: {len(self.db.get_all_users())}
 • Watchlist: {sum(len(items) for items in self.db.watchlist.values())}
 • Banlist: {sum(len(items) for items in self.db.banlist.values())}
+• Mode: <b>INSTANT NOTIFICATIONS</b>
 
 ━━━━━━━━━━━━━━━━━━━━━
 <b>Commands:</b>
@@ -1740,6 +1916,8 @@ async def run_bot():
         )
         
         logger.info("Bot is running! Single force join: @proxydominates")
+        logger.info("MODE: INSTANT NOTIFICATIONS on status change")
+        logger.info("FEATURE: Detailed info when adding to watchlist")
         
         # Keep running
         while True:
