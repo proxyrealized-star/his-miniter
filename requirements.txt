@@ -3,3 +3,4 @@ Flask
 gunicorn
 aiohttp
 python-dotenv
+pymongo
