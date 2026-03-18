@@ -3,7 +3,7 @@ Professional Instagram Username Monitor Bot
 Single Channel Force Join - @proxydominates
 All buttons working, subscription system, monitoring
 Author: @proxyfxc
-Version: 4.4.0 (INSTANT NOTIFICATIONS + ADD DETAILS)
+Version: 6.2.0 (FINAL - FIXED UNBAN DETAILS)
 """
 
 import os
@@ -20,7 +20,7 @@ import re
 
 # Third-party imports
 from flask import Flask, jsonify
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -30,6 +30,10 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 import aiohttp
 from dotenv import load_dotenv
+
+# MongoDB import
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, DuplicateKeyError
 
 # Load environment variables
 load_dotenv()
@@ -41,8 +45,12 @@ class Config:
     
     # Bot Configuration
     BOT_TOKEN = os.getenv('BOT_TOKEN', '7728850256:AAFhVPRzSANY905UESCad1al2RsJtqQDmCw')
-    API_KEY = 'PAID_INSTA_SELL187'  # Hardcoded API key
-    API_BASE_URL = 'https://tg-user-id-to-number-4erk.onrender.com/api'  # Hardcoded base URL
+    API_KEY = 'PAID_INSTA_SELL187'
+    API_BASE_URL = 'https://tg-user-id-to-number-4erk.onrender.com/api'
+    
+    # MongoDB Configuration
+    MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+    DATABASE_NAME = 'instagram_monitor'
     
     # Admin Configuration
     OWNER_IDS = [int(id) for id in os.getenv('OWNER_IDS', '7805871651').split(',')]
@@ -57,19 +65,13 @@ class Config:
     DEFAULT_USER_LIMIT = 20
     
     # Monitoring Configuration
-    CHECK_INTERVAL = 300  # 5 minutes
-    STATUS_DELAY = 10  # 10 seconds delay between status checks
+    CHECK_INTERVAL = 600  # 10 minutes
+    VERIFICATION_DELAY = 120  # 2 minutes
+    STATUS_DELAY = 10  # 10 seconds
     
     # Flask Keep-alive
     FLASK_HOST = '0.0.0.0'
     FLASK_PORT = int(os.getenv('PORT', 8080))
-    
-    # Database
-    DATA_DIR = 'data'
-    USERS_FILE = 'users.json'
-    WATCHLIST_FILE = 'watchlist.json'
-    BANLIST_FILE = 'banlist.json'
-    CONFIRMATIONS_FILE = 'confirmations.json'
 
 
 # ==================== LOGGING SETUP ====================
@@ -81,140 +83,325 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ==================== DATABASE MANAGER ====================
+# ==================== MONGODB DATABASE MANAGER ====================
 
-class DatabaseManager:
-    """Persistent JSON storage manager with thread-safe operations"""
+class MongoDBManager:
+    """MongoDB persistent storage manager"""
     
     def __init__(self):
-        self.data_dir = Path(Config.DATA_DIR)
-        self.data_dir.mkdir(exist_ok=True)
+        """Initialize MongoDB connection"""
+        self.client = None
+        self.db = None
+        self.connect()
         
-        self.users_file = self.data_dir / Config.USERS_FILE
-        self.watchlist_file = self.data_dir / Config.WATCHLIST_FILE
-        self.banlist_file = self.data_dir / Config.BANLIST_FILE
-        self.confirmations_file = self.data_dir / Config.CONFIRMATIONS_FILE
+        # Collections
+        self.users_collection = None
+        self.watchlist_collection = None
+        self.banlist_collection = None
+        self.pending_collection = None
         
-        # Initialize data structures
-        self.users = self._load_json(self.users_file, {})
-        self.watchlist = self._load_json(self.watchlist_file, {})
-        self.banlist = self._load_json(self.banlist_file, {})
-        self.confirmations = self._load_json(self.confirmations_file, {})
-        
-        logger.info("Database initialized successfully")
+        if self.db:
+            self._init_collections()
+            logger.info("✅ MongoDB connected successfully")
+        else:
+            logger.error("❌ MongoDB connection failed")
     
-    def _load_json(self, file_path: Path, default: Any) -> Any:
+    def connect(self):
+        """Connect to MongoDB"""
         try:
-            if file_path.exists():
-                with open(file_path, 'r') as f:
-                    return json.load(f)
-            return default
-        except Exception as e:
-            logger.error(f"Error loading {file_path}: {e}")
-            return default
+            self.client = MongoClient(Config.MONGODB_URI, serverSelectionTimeoutMS=5000)
+            self.client.admin.command('ping')
+            self.db = self.client[Config.DATABASE_NAME]
+            logger.info("MongoDB connection established")
+        except ConnectionFailure as e:
+            logger.error(f"MongoDB connection failed: {e}")
+            self.client = None
+            self.db = None
     
-    def _save_json(self, file_path: Path, data: Any) -> bool:
-        try:
-            with open(file_path, 'w') as f:
-                json.dump(data, f, indent=2)
-            return True
-        except Exception as e:
-            logger.error(f"Error saving {file_path}: {e}")
-            return False
+    def _init_collections(self):
+        """Initialize collections and indexes"""
+        self.users_collection = self.db['users']
+        self.users_collection.create_index('user_id', unique=True)
+        
+        self.watchlist_collection = self.db['watchlist']
+        self.watchlist_collection.create_index([('user_id', 1), ('username', 1)], unique=True)
+        self.watchlist_collection.create_index('user_id')
+        
+        self.banlist_collection = self.db['banlist']
+        self.banlist_collection.create_index([('user_id', 1), ('username', 1)], unique=True)
+        self.banlist_collection.create_index('user_id')
+        
+        self.pending_collection = self.db['pending']
+        self.pending_collection.create_index('username', unique=True)
+        self.pending_collection.create_index('first_detected')
     
-    def save_all(self):
-        self._save_json(self.users_file, self.users)
-        self._save_json(self.watchlist_file, self.watchlist)
-        self._save_json(self.banlist_file, self.banlist)
-        self._save_json(self.confirmations_file, self.confirmations)
+    # ===== USER MANAGEMENT =====
     
-    # User Management
     def get_user(self, user_id: int) -> Dict:
-        return self.users.get(str(user_id), {})
+        if not self.db:
+            return {}
+        user = self.users_collection.find_one({'user_id': user_id})
+        if user:
+            user.pop('_id', None)
+        return user or {}
     
     def create_user(self, user_id: int, username: str = "", first_name: str = "") -> Dict:
-        str_id = str(user_id)
-        if str_id not in self.users:
-            self.users[str_id] = {
-                'user_id': user_id,
-                'username': username,
-                'first_name': first_name,
-                'role': 'user',
-                'subscription_expiry': None,
-                'joined_date': datetime.now().isoformat(),
-                'approved_by': None,
-                'approved_days': 0,
-                'verified': False,  # For force join
-                'notification_preferences': {
-                    'ban_alerts': True,
-                    'unban_alerts': True
-                }
+        if not self.db:
+            return {}
+        
+        user_data = {
+            'user_id': user_id,
+            'username': username,
+            'first_name': first_name,
+            'role': 'user',
+            'subscription_expiry': None,
+            'joined_date': datetime.now().isoformat(),
+            'approved_by': None,
+            'approved_days': 0,
+            'verified': False,
+            'notification_preferences': {
+                'ban_alerts': True,
+                'unban_alerts': True
             }
-            self.save_all()
-        return self.users[str_id]
+        }
+        
+        try:
+            self.users_collection.update_one(
+                {'user_id': user_id},
+                {'$setOnInsert': user_data},
+                upsert=True
+            )
+        except Exception as e:
+            logger.error(f"Error creating user {user_id}: {e}")
+        
+        return user_data
     
     def update_user(self, user_id: int, **kwargs) -> bool:
-        str_id = str(user_id)
-        if str_id in self.users:
-            self.users[str_id].update(kwargs)
-            self.save_all()
-            return True
-        return False
+        if not self.db:
+            return False
+        try:
+            result = self.users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': kwargs}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Error updating user {user_id}: {e}")
+            return False
     
-    def get_all_users(self) -> Dict:
-        return self.users
+    def get_all_users(self) -> List[Dict]:
+        if not self.db:
+            return []
+        users = list(self.users_collection.find())
+        for user in users:
+            user.pop('_id', None)
+        return users
     
-    # Watchlist Management
+    # ===== WATCHLIST MANAGEMENT =====
+    
     def get_watchlist(self, user_id: int) -> List[str]:
-        return self.watchlist.get(str(user_id), [])
+        if not self.db:
+            return []
+        cursor = self.watchlist_collection.find(
+            {'user_id': user_id},
+            {'username': 1, '_id': 0}
+        )
+        return [doc['username'] for doc in cursor]
     
     def add_to_watchlist(self, user_id: int, username: str) -> bool:
-        str_id = str(user_id)
-        if str_id not in self.watchlist:
-            self.watchlist[str_id] = []
-        
+        if not self.db:
+            return False
         username = username.lower().strip().lstrip('@')
-        if username not in self.watchlist[str_id]:
-            self.watchlist[str_id].append(username)
-            self.save_all()
+        try:
+            self.watchlist_collection.update_one(
+                {'user_id': user_id, 'username': username},
+                {'$setOnInsert': {
+                    'user_id': user_id,
+                    'username': username,
+                    'added_at': datetime.now().isoformat()
+                }},
+                upsert=True
+            )
             return True
-        return False
+        except DuplicateKeyError:
+            return False
+        except Exception as e:
+            logger.error(f"Error adding to watchlist: {e}")
+            return False
     
     def remove_from_watchlist(self, user_id: int, username: str) -> bool:
-        str_id = str(user_id)
-        if str_id in self.watchlist:
-            username = username.lower().strip().lstrip('@')
-            if username in self.watchlist[str_id]:
-                self.watchlist[str_id].remove(username)
-                self.save_all()
-                return True
-        return False
+        if not self.db:
+            return False
+        username = username.lower().strip().lstrip('@')
+        try:
+            result = self.watchlist_collection.delete_one({
+                'user_id': user_id,
+                'username': username
+            })
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Error removing from watchlist: {e}")
+            return False
     
-    # Banlist Management
+    # ===== BANLIST MANAGEMENT =====
+    
     def get_banlist(self, user_id: int) -> List[str]:
-        return self.banlist.get(str(user_id), [])
+        if not self.db:
+            return []
+        cursor = self.banlist_collection.find(
+            {'user_id': user_id},
+            {'username': 1, '_id': 0}
+        )
+        return [doc['username'] for doc in cursor]
     
     def add_to_banlist(self, user_id: int, username: str) -> bool:
-        str_id = str(user_id)
-        if str_id not in self.banlist:
-            self.banlist[str_id] = []
-        
+        if not self.db:
+            return False
         username = username.lower().strip().lstrip('@')
-        if username not in self.banlist[str_id]:
-            self.banlist[str_id].append(username)
-            self.save_all()
+        try:
+            self.banlist_collection.update_one(
+                {'user_id': user_id, 'username': username},
+                {'$setOnInsert': {
+                    'user_id': user_id,
+                    'username': username,
+                    'added_at': datetime.now().isoformat()
+                }},
+                upsert=True
+            )
             return True
-        return False
+        except DuplicateKeyError:
+            return False
+        except Exception as e:
+            logger.error(f"Error adding to banlist: {e}")
+            return False
     
     def remove_from_banlist(self, user_id: int, username: str) -> bool:
-        str_id = str(user_id)
-        if str_id in self.banlist:
-            username = username.lower().strip().lstrip('@')
-            if username in self.banlist[str_id]:
-                self.banlist[str_id].remove(username)
-                self.save_all()
-                return True
-        return False
+        if not self.db:
+            return False
+        username = username.lower().strip().lstrip('@')
+        try:
+            result = self.banlist_collection.delete_one({
+                'user_id': user_id,
+                'username': username
+            })
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Error removing from banlist: {e}")
+            return False
+    
+    # ===== PENDING VERIFICATIONS =====
+    
+    def add_pending_verification(self, username: str, user_ids: List[int], old_status: str, 
+                                 new_status: str, list_type: str, details: Dict):
+        if not self.db:
+            return
+        username = username.lower().strip().lstrip('@')
+        pending_data = {
+            'username': username,
+            'user_ids': user_ids,
+            'old_status': old_status,
+            'new_status': new_status,
+            'list_type': list_type,
+            'details': details,
+            'first_detected': datetime.now().isoformat(),
+            'verified': False
+        }
+        try:
+            self.pending_collection.update_one(
+                {'username': username},
+                {'$set': pending_data},
+                upsert=True
+            )
+        except Exception as e:
+            logger.error(f"Error adding pending verification: {e}")
+    
+    def get_pending_verification(self, username: str) -> Optional[Dict]:
+        if not self.db:
+            return None
+        username = username.lower().strip().lstrip('@')
+        pending = self.pending_collection.find_one({'username': username})
+        if pending:
+            pending.pop('_id', None)
+        return pending
+    
+    def remove_pending_verification(self, username: str):
+        if not self.db:
+            return
+        username = username.lower().strip().lstrip('@')
+        self.pending_collection.delete_one({'username': username})
+    
+    def get_all_pending(self) -> Dict:
+        if not self.db:
+            return {}
+        pendings = {}
+        cursor = self.pending_collection.find()
+        for doc in cursor:
+            username = doc.pop('username')
+            doc.pop('_id', None)
+            pendings[username] = doc
+        return pendings
+    
+    def move_from_watch_to_ban(self, user_id: int, username: str):
+        if not self.db:
+            return
+        self.remove_from_watchlist(user_id, username)
+        self.add_to_banlist(user_id, username)
+    
+    def move_from_ban_to_watch(self, user_id: int, username: str):
+        if not self.db:
+            return
+        self.remove_from_banlist(user_id, username)
+        self.add_to_watchlist(user_id, username)
+    
+    def get_all_watchlist_items(self) -> Dict[str, List[int]]:
+        if not self.db:
+            return {}
+        result = {}
+        cursor = self.watchlist_collection.find()
+        for doc in cursor:
+            username = doc['username']
+            user_id = doc['user_id']
+            if username not in result:
+                result[username] = []
+            result[username].append(user_id)
+        return result
+    
+    def get_all_banlist_items(self) -> Dict[str, List[int]]:
+        if not self.db:
+            return {}
+        result = {}
+        cursor = self.banlist_collection.find()
+        for doc in cursor:
+            username = doc['username']
+            user_id = doc['user_id']
+            if username not in result:
+                result[username] = []
+            result[username].append(user_id)
+        return result
+    
+    def get_watchlist_count(self, user_id: int) -> int:
+        if not self.db:
+            return 0
+        return self.watchlist_collection.count_documents({'user_id': user_id})
+    
+    def get_banlist_count(self, user_id: int) -> int:
+        if not self.db:
+            return 0
+        return self.banlist_collection.count_documents({'user_id': user_id})
+    
+    def get_total_watchlist_count(self) -> int:
+        if not self.db:
+            return 0
+        return self.watchlist_collection.count_documents({})
+    
+    def get_total_banlist_count(self) -> int:
+        if not self.db:
+            return 0
+        return self.banlist_collection.count_documents({})
+    
+    def close(self):
+        if self.client:
+            self.client.close()
 
 
 # ==================== API CLIENT ====================
@@ -233,42 +420,49 @@ class InstagramAPIClient:
         return self.session
     
     async def check_username(self, username: str) -> Tuple[str, Dict, str]:
-        """
-        Check username with the hardcoded API
-        Returns: (status, profile_data, profile_pic_url)
-        """
-        try:
-            session = await self._get_session()
-            # Construct URL with hardcoded API key
-            url = f"{self.base_url}/insta={username}?api_key={self.api_key}"
-            
-            logger.info(f"Checking API: {url}")
-            
-            async with session.get(url, timeout=30) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    
-                    logger.info(f"API Response for @{username}: {json.dumps(data)[:200]}...")
-                    
-                    # Check if status is ok and profile exists
-                    if data.get('status') == 'ok' and 'profile' in data:
-                        profile = data['profile']
-                        profile_pic = profile.get('profile_pic_url_hd', '')
-                        return 'ACTIVE', profile, profile_pic
-                    elif data.get('error'):
-                        return 'BANNED', {}, ''
-                    else:
-                        return 'BANNED', {}, ''
-                else:
-                    logger.error(f"HTTP {response.status} for @{username}")
-                    return 'BANNED', {}, ''
+        max_retries = 3
+        retry_delay = 5
+        
+        for attempt in range(max_retries):
+            try:
+                session = await self._get_session()
+                url = f"{self.base_url}/insta={username}?api_key={self.api_key}"
+                
+                logger.info(f"Checking API (attempt {attempt+1}/{max_retries}): {url}")
+                
+                async with session.get(url, timeout=30) as response:
+                    if response.status == 200:
+                        data = await response.json()
                         
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout for @{username}")
-            return 'BANNED', {}, ''
-        except Exception as e:
-            logger.error(f"Error checking username {username}: {e}")
-            return 'BANNED', {}, ''
+                        if data.get('status') == 'ok' and 'profile' in data:
+                            profile = data['profile']
+                            profile_pic = profile.get('profile_pic_url_hd', '')
+                            return 'ACTIVE', profile, profile_pic
+                        elif data.get('error'):
+                            return 'BANNED', {}, ''
+                        else:
+                            return 'BANNED', {}, ''
+                    else:
+                        logger.warning(f"HTTP {response.status} for @{username}, attempt {attempt+1}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        return 'BANNED', {}, ''
+                        
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout for @{username}, attempt {attempt+1}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    continue
+                return 'BANNED', {}, ''
+            except Exception as e:
+                logger.error(f"Error checking username {username} (attempt {attempt+1}): {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    continue
+                return 'BANNED', {}, ''
+        
+        return 'BANNED', {}, ''
     
     async def close(self):
         if self.session and not self.session.closed:
@@ -276,26 +470,23 @@ class InstagramAPIClient:
 
 
 # ==================== MONITORING ENGINE ====================
-# MODIFIED: Instant notifications on single check
 
 class MonitoringEngine:
-    """Background monitoring engine with INSTANT notifications"""
+    """Background monitoring engine with 2-STEP VERIFICATION"""
     
-    def __init__(self, db: DatabaseManager, api_client: InstagramAPIClient, bot_app: Application):
+    def __init__(self, db: MongoDBManager, api_client: InstagramAPIClient, bot_app: Application):
         self.db = db
         self.api_client = api_client
         self.bot_app = bot_app
         self.is_running = False
         self.task = None
-        
-        # Track last status to detect changes
         self.last_status = {}
     
     async def start(self):
         if not self.is_running:
             self.is_running = True
             self.task = asyncio.create_task(self._monitoring_loop())
-            logger.info("Monitoring engine started - INSTANT NOTIFICATIONS MODE")
+            logger.info("✅ Monitoring engine started - 2-STEP VERIFICATION MODE")
     
     async def stop(self):
         self.is_running = False
@@ -313,34 +504,28 @@ class MonitoringEngine:
                 start_time = datetime.now()
                 logger.info("Starting monitoring cycle")
                 
-                # Track all usernames and their users
-                usernames_to_check = {}
+                await self._check_pending_verifications()
                 
-                # Add watchlist items
-                for user_id_str, usernames in self.db.watchlist.items():
-                    for username in usernames:
-                        if username not in usernames_to_check:
-                            usernames_to_check[username] = {
-                                'user_ids': [],
-                                'list_type': 'watch'
-                            }
-                        usernames_to_check[username]['user_ids'].append(int(user_id_str))
+                watchlist_items = self.db.get_all_watchlist_items()
+                banlist_items = self.db.get_all_banlist_items()
                 
-                # Add banlist items
-                for user_id_str, usernames in self.db.banlist.items():
-                    for username in usernames:
-                        if username not in usernames_to_check:
-                            usernames_to_check[username] = {
-                                'user_ids': [],
-                                'list_type': 'ban'
-                            }
-                        usernames_to_check[username]['user_ids'].append(int(user_id_str))
+                all_usernames = set(watchlist_items.keys()) | set(banlist_items.keys())
                 
-                # Check each username
-                for username, info in usernames_to_check.items():
+                for username in all_usernames:
                     try:
-                        await self._check_single_username(username, info['user_ids'], info['list_type'])
+                        user_ids = []
+                        list_type = 'watch'
+                        
+                        if username in watchlist_items:
+                            user_ids.extend(watchlist_items[username])
+                        
+                        if username in banlist_items:
+                            user_ids.extend(banlist_items[username])
+                            list_type = 'ban' if username not in watchlist_items else 'both'
+                        
+                        await self._check_single_username(username, user_ids, list_type)
                         await asyncio.sleep(1)
+                        
                     except Exception as e:
                         logger.error(f"Error checking username {username}: {e}")
                         continue
@@ -358,60 +543,110 @@ class MonitoringEngine:
                 logger.error(f"Error in monitoring loop: {e}")
                 await asyncio.sleep(60)
     
+    async def _check_pending_verifications(self):
+        """Check pending verifications that are 2 minutes old - FIXED for unban details"""
+        pending = self.db.get_all_pending()
+        now = datetime.now()
+        
+        for username, data in list(pending.items()):
+            try:
+                first_detected = datetime.fromisoformat(data['first_detected'])
+                age_seconds = (now - first_detected).total_seconds()
+                
+                if age_seconds >= Config.VERIFICATION_DELAY and not data.get('verified', False):
+                    logger.info(f"Verifying pending @{username} after {age_seconds:.0f}s")
+                    
+                    status, details, profile_pic = await self.api_client.check_username(username)
+                    
+                    if status == data['new_status']:
+                        logger.info(f"✅ Verified: @{username} still {status} - sending alert")
+                        
+                        data['verified'] = True
+                        
+                        # ===== FIX: For UNBAN (ACTIVE status), use new details from API =====
+                        if status == 'ACTIVE' and details:
+                            final_details = details
+                            logger.info(f"✅ Using NEW active details for @{username}")
+                        else:
+                            final_details = data['details']
+                            logger.info(f"Using stored details for @{username}")
+                        
+                        await self._send_verified_alert(
+                            username, 
+                            data['user_ids'], 
+                            status, 
+                            data['list_type'], 
+                            final_details,
+                            profile_pic,
+                            data['first_detected']
+                        )
+                        
+                        self.db.remove_pending_verification(username)
+                    else:
+                        logger.info(f"❌ False alarm: @{username} changed back to {status}")
+                        self.db.remove_pending_verification(username)
+                        
+            except Exception as e:
+                logger.error(f"Error checking pending {username}: {e}")
+    
     async def _check_single_username(self, username: str, user_ids: List[int], list_type: str):
-        """MODIFIED: Instant notification on status change"""
         status, details, profile_pic = await self.api_client.check_username(username)
         
-        # Get previous status
         prev_status = self.last_status.get(username)
         
-        # If status changed and we have previous status
         if prev_status and prev_status != status:
-            logger.info(f"Status changed for @{username}: {prev_status} -> {status}")
+            logger.info(f"Status change detected for @{username}: {prev_status} -> {status}")
             
-            # Process alert immediately
-            await self._process_alert(username, user_ids, status, list_type, details, profile_pic)
+            pending = self.db.get_pending_verification(username)
+            
+            if not pending:
+                self.db.add_pending_verification(
+                    username, 
+                    user_ids, 
+                    prev_status, 
+                    status, 
+                    list_type, 
+                    details
+                )
+                logger.info(f"@{username} added to pending verification - will check again in 2 minutes")
         
-        # Update last status
         self.last_status[username] = status
     
-    async def _process_alert(self, username: str, user_ids: List[int], status: str, list_type: str, details: Dict, profile_pic: str):
-        """Process alert for all users watching this username"""
+    async def _send_verified_alert(self, username: str, user_ids: List[int], status: str, 
+                                   list_type: str, details: Dict, profile_pic: str, detection_time: str):
         
         for user_id in user_ids:
             try:
                 user_data = self.db.get_user(user_id)
                 
-                # Check if this is a ban event (watchlist -> banned)
-                if status == 'BANNED' and list_type == 'watch':
-                    # Move from watchlist to banlist
-                    self.db.remove_from_watchlist(user_id, username)
-                    self.db.add_to_banlist(user_id, username)
-                    
-                    # Send notification if enabled
-                    if user_data.get('notification_preferences', {}).get('ban_alerts', True):
-                        await self._send_ban_alert(user_id, username, details, profile_pic)
+                if not user_data:
+                    continue
                 
-                # Check if this is an unban event (banlist -> active)
-                elif status == 'ACTIVE' and list_type == 'ban':
-                    # Move from banlist to watchlist
-                    self.db.remove_from_banlist(user_id, username)
-                    self.db.add_to_watchlist(user_id, username)
-                    
-                    # Send notification if enabled
-                    if user_data.get('notification_preferences', {}).get('unban_alerts', True):
-                        await self._send_unban_alert(user_id, username, details, profile_pic)
+                if status == 'BANNED':
+                    if list_type == 'watch' or list_type == 'both':
+                        self.db.move_from_watch_to_ban(user_id, username)
+                        
+                        if user_data.get('notification_preferences', {}).get('ban_alerts', True):
+                            await self._send_ban_alert(user_id, username, details, profile_pic, detection_time)
+                
+                elif status == 'ACTIVE':
+                    if list_type == 'ban' or list_type == 'both':
+                        self.db.move_from_ban_to_watch(user_id, username)
+                        
+                        if user_data.get('notification_preferences', {}).get('unban_alerts', True):
+                            await self._send_unban_alert(user_id, username, details, profile_pic, detection_time)
                         
             except Exception as e:
                 logger.error(f"Error processing alert for user {user_id}: {e}")
                 continue
     
-    async def _send_ban_alert(self, user_id: int, username: str, details: Dict, profile_pic: str):
-        """Send ban alert with profile picture if available"""
+    async def _send_ban_alert(self, user_id: int, username: str, details: Dict, profile_pic: str, detection_time: str):
         try:
-            message = self._format_ban_alert(username, details)
+            message = self._format_ban_alert(username, details, detection_time)
             
-            # Try to send with profile picture
+            keyboard = [[InlineKeyboardButton("📞 CONTACT @proxyfxc", url="https://t.me/proxyfxc")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
             if profile_pic:
                 try:
                     async with aiohttp.ClientSession() as session:
@@ -422,27 +657,29 @@ class MonitoringEngine:
                                     chat_id=user_id,
                                     photo=photo_data,
                                     caption=message,
-                                    parse_mode=ParseMode.HTML
+                                    parse_mode=ParseMode.HTML,
+                                    reply_markup=reply_markup
                                 )
                                 return
                 except Exception as e:
                     logger.error(f"Error sending photo: {e}")
             
-            # Fallback to text message
             await self.bot_app.bot.send_message(
                 chat_id=user_id,
                 text=message,
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
             )
         except Exception as e:
             logger.error(f"Failed to send ban alert: {e}")
     
-    async def _send_unban_alert(self, user_id: int, username: str, details: Dict, profile_pic: str):
-        """Send unban alert with profile picture if available"""
+    async def _send_unban_alert(self, user_id: int, username: str, details: Dict, profile_pic: str, detection_time: str):
         try:
-            message = self._format_unban_alert(username, details)
+            message = self._format_unban_alert(username, details, detection_time)
             
-            # Try to send with profile picture
+            keyboard = [[InlineKeyboardButton("📞 CONTACT @proxyfxc", url="https://t.me/proxyfxc")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
             if profile_pic:
                 try:
                     async with aiohttp.ClientSession() as session:
@@ -453,30 +690,29 @@ class MonitoringEngine:
                                     chat_id=user_id,
                                     photo=photo_data,
                                     caption=message,
-                                    parse_mode=ParseMode.HTML
+                                    parse_mode=ParseMode.HTML,
+                                    reply_markup=reply_markup
                                 )
                                 return
                 except Exception as e:
                     logger.error(f"Error sending photo: {e}")
             
-            # Fallback to text message
             await self.bot_app.bot.send_message(
                 chat_id=user_id,
                 text=message,
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
             )
         except Exception as e:
             logger.error(f"Failed to send unban alert: {e}")
     
-    def _format_ban_alert(self, username: str, details: Dict) -> str:
-        """Format ban alert with profile details"""
+    def _format_ban_alert(self, username: str, details: Dict, detection_time: str) -> str:
         name = details.get('full_name', username)
         followers = details.get('follower_count', 'N/A')
         following = details.get('following_count', 'N/A')
         posts = details.get('media_count', 'N/A')
         is_private = details.get('is_private', False)
         
-        # Format numbers
         try:
             followers = f"{int(followers):,}" if followers != 'N/A' else 'N/A'
         except:
@@ -491,6 +727,12 @@ class MonitoringEngine:
             posts = f"{int(posts):,}" if posts != 'N/A' else 'N/A'
         except:
             posts = str(posts)
+        
+        try:
+            dt = datetime.fromisoformat(detection_time)
+            display_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+        except:
+            display_time = detection_time
         
         return f"""
 🔴 <b>🚨 BANNED ACCOUNT DETECTED</b> 🔴
@@ -505,23 +747,20 @@ class MonitoringEngine:
 🔐 <b>Private:</b> {'Yes' if is_private else 'No'}
 
 ⚠️ <b>Status:</b> <code>BANNED / SUSPENDED</code>
-⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+✅ <b>Verified:</b> <code>2-STEP CONFIRMATION</code>
+⏰ <b>First Detected:</b> {display_time}
 
 ━━━━━━━━━━━━━━━━━━━━━
 <i>Account moved to Ban List automatically</i>
-
-Powered by @proxyfxc
 """
     
-    def _format_unban_alert(self, username: str, details: Dict) -> str:
-        """Format unban alert with profile details"""
+    def _format_unban_alert(self, username: str, details: Dict, detection_time: str) -> str:
         name = details.get('full_name', username)
         followers = details.get('follower_count', 'N/A')
         following = details.get('following_count', 'N/A')
         posts = details.get('media_count', 'N/A')
         is_private = details.get('is_private', False)
         
-        # Format numbers
         try:
             followers = f"{int(followers):,}" if followers != 'N/A' else 'N/A'
         except:
@@ -537,6 +776,12 @@ Powered by @proxyfxc
         except:
             posts = str(posts)
         
+        try:
+            dt = datetime.fromisoformat(detection_time)
+            display_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+        except:
+            display_time = detection_time
+        
         return f"""
 🟢 <b>✅ ACCOUNT UNBANNED</b> 🟢
 
@@ -550,12 +795,11 @@ Powered by @proxyfxc
 🔐 <b>Private:</b> {'Yes' if is_private else 'No'}
 
 ✅ <b>Status:</b> <code>ACTIVE / RESTORED</code>
-⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+✅ <b>Verified:</b> <code>2-STEP CONFIRMATION</code>
+⏰ <b>First Detected:</b> {display_time}
 
 ━━━━━━━━━━━━━━━━━━━━━
 <i>Account moved back to Watch List automatically</i>
-
-Powered by @proxyfxc
 """
 
 
@@ -578,7 +822,8 @@ def health():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'monitoring_active': monitoring_engine.is_running if monitoring_engine else False
+        'monitoring_active': monitoring_engine.is_running if monitoring_engine else False,
+        'mongodb_connected': db.db is not None if db else False
     })
 
 def run_flask():
@@ -590,11 +835,9 @@ def run_flask():
 class BotHandlers:
     """All Telegram bot command and callback handlers"""
     
-    def __init__(self, db: DatabaseManager, api_client: InstagramAPIClient):
+    def __init__(self, db: MongoDBManager, api_client: InstagramAPIClient):
         self.db = db
         self.api_client = api_client
-    
-    # ===== UTILITY FUNCTIONS =====
     
     def is_owner(self, user_id: int) -> bool:
         return user_id in Config.OWNER_IDS
@@ -626,11 +869,7 @@ class BotHandlers:
             return float('inf')
         return Config.DEFAULT_USER_LIMIT
     
-    # ===== FORMATTING FUNCTIONS =====
-    
     def format_account_info(self, username: str, status: str, details: Dict) -> str:
-        """Format account information with the exact style requested"""
-        
         if status == 'ACTIVE':
             name = details.get('full_name', username)
             followers = details.get('followers', details.get('follower_count', 0))
@@ -638,7 +877,6 @@ class BotHandlers:
             posts = details.get('posts', details.get('media_count', 0))
             is_private = details.get('is_private', False)
             
-            # Convert to int if they're strings
             try:
                 followers = int(followers)
             except:
@@ -654,7 +892,6 @@ class BotHandlers:
             
             private_text = 'Yes' if is_private else 'No'
             
-            # Format numbers with commas if they're integers
             followers_str = f"{followers:,}" if isinstance(followers, int) else str(followers)
             following_str = f"{following:,}" if isinstance(following, int) else str(following)
             posts_str = f"{posts:,}" if isinstance(posts, int) else str(posts)
@@ -698,11 +935,7 @@ Profile: @{username}
 ━━━━━━━━━━━━━━━━━━━━━
 """
     
-    # ===== FORMAT ADD WATCH DETAILS =====
-    
     def format_add_watch_details(self, username: str, status: str, details: Dict, current_count: int, limit: Any) -> str:
-        """Format detailed message when adding to watchlist"""
-        
         if status == 'ACTIVE':
             name = details.get('full_name', username)
             followers = details.get('followers', details.get('follower_count', 0))
@@ -710,7 +943,6 @@ Profile: @{username}
             posts = details.get('posts', details.get('media_count', 0))
             is_private = details.get('is_private', False)
             
-            # Convert to int if they're strings
             try:
                 followers = int(followers)
             except:
@@ -726,7 +958,6 @@ Profile: @{username}
             
             private_text = 'Yes' if is_private else 'No'
             
-            # Format numbers with commas if they're integers
             followers_str = f"{followers:,}" if isinstance(followers, int) else str(followers)
             following_str = f"{following:,}" if isinstance(following, int) else str(following)
             posts_str = f"{posts:,}" if isinstance(posts, int) else str(posts)
@@ -749,7 +980,7 @@ Profile: @{username}
 ━━━━━━━━━━━━━━━━━━━━━
 📊 <b>Watch List:</b> {limit_text}
 
-<i>You will be notified when status changes</i>
+<i>You will be notified when status changes (2-step verification)</i>
 ━━━━━━━━━━━━━━━━━━━━━
 """
         elif status == 'BANNED':
@@ -767,7 +998,7 @@ Profile: @{username}
 ━━━━━━━━━━━━━━━━━━━━━
 📊 <b>Watch List:</b> {limit_text}
 
-<i>You will be notified when unbanned</i>
+<i>You will be notified when unbanned (2-step verification)</i>
 ━━━━━━━━━━━━━━━━━━━━━
 """
         else:
@@ -784,16 +1015,12 @@ Profile: @{username}
 ━━━━━━━━━━━━━━━━━━━━━
 📊 <b>Watch List:</b> {limit_text}
 
-<i>You will be notified if account becomes active</i>
+<i>You will be notified if account becomes active (2-step verification)</i>
 ━━━━━━━━━━━━━━━━━━━━━
 """
     
-    # ===== SINGLE CHANNEL FORCE JOIN - @proxydominates ONLY =====
-    
     async def check_force_join(self, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-        """Check if user has joined @proxydominates"""
         try:
-            # Check if already verified
             user_data = self.db.get_user(user_id)
             if user_data.get('verified', False):
                 return True
@@ -801,19 +1028,15 @@ Profile: @{username}
             channel = Config.FORCE_JOIN_CHANNEL
             channel_username = channel['username']
             
-            # Ensure @ is present
             if not channel_username.startswith('@'):
                 channel_username = '@' + channel_username
             
-            # Get chat member
             member = await context.bot.get_chat_member(
                 chat_id=channel_username,
                 user_id=user_id
             )
             
-            # Check if user is member, admin, or creator
             if member.status in ['member', 'administrator', 'creator']:
-                # Mark as verified
                 self.db.update_user(user_id, verified=True)
                 return True
             else:
@@ -824,7 +1047,6 @@ Profile: @{username}
             return False
     
     async def send_force_join_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send force join message for @proxydominates"""
         channel = Config.FORCE_JOIN_CHANNEL
         
         keyboard = [
@@ -858,8 +1080,6 @@ To use this bot, you must join our channel first:
 2️⃣ Join the channel
 3️⃣ Click "I've Joined"
 4️⃣ Bot will start automatically
-
-<i>Powered by @proxyfxc</i>
 """
         
         await update.message.reply_text(
@@ -869,28 +1089,21 @@ To use this bot, you must join our channel first:
             disable_web_page_preview=True
         )
     
-    # ===== COMMAND HANDLERS =====
-    
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
         user = update.effective_user
         
-        # Create or get user
         self.db.create_user(
             user_id=user.id,
             username=user.username or "",
             first_name=user.first_name or ""
         )
         
-        # Check force join
         if not await self.check_force_join(user.id, context):
             await self.send_force_join_message(update, context)
             return
         
-        # Show main menu
         await self.show_main_menu(update, context)
         
-        # Notify owner about new user
         if not self.is_admin(user.id):
             for owner_id in Config.OWNER_IDS:
                 try:
@@ -903,13 +1116,11 @@ To use this bot, you must join our channel first:
                     pass
     
     async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show main menu with all buttons"""
         user = update.effective_user
-        watch_count = len(self.db.get_watchlist(user.id))
-        ban_count = len(self.db.get_banlist(user.id))
+        watch_count = self.db.get_watchlist_count(user.id)
+        ban_count = self.db.get_banlist_count(user.id)
         limit = self.get_user_limit(user.id)
         
-        # Main menu keyboard - ALL BUTTONS WORKING
         keyboard = [
             [
                 InlineKeyboardButton("📋 Watch List", callback_data="menu_watch"),
@@ -927,12 +1138,12 @@ To use this bot, you must join our channel first:
                 InlineKeyboardButton("⛔ Add to Ban", callback_data="menu_addban"),
                 InlineKeyboardButton("✅ Remove Ban", callback_data="menu_removeban")
             ],
-            [InlineKeyboardButton("ℹ️ Help & Info", callback_data="menu_help")]
+            [InlineKeyboardButton("ℹ️ Help & Info", callback_data="menu_help")],
+            [InlineKeyboardButton("📞 CONTACT @proxyfxc", url="https://t.me/proxyfxc")]
         ]
         
-        # Add admin panel button for admins
         if self.is_admin(user.id):
-            keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="menu_admin")])
+            keyboard.insert(4, [InlineKeyboardButton("⚙️ Admin Panel", callback_data="menu_admin")])
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -968,7 +1179,6 @@ Welcome <b>{user.first_name}</b>!
             )
     
     async def watch_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show watch list"""
         user = update.effective_user
         watchlist = self.db.get_watchlist(user.id)
         watch_count = len(watchlist)
@@ -1012,7 +1222,6 @@ Welcome <b>{user.first_name}</b>!
             )
     
     async def ban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show ban list"""
         user = update.effective_user
         banlist = self.db.get_banlist(user.id)
         
@@ -1054,7 +1263,6 @@ Welcome <b>{user.first_name}</b>!
             )
     
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show user status and check all watchlist accounts with 10-second delays"""
         user = update.effective_user
         
         if not await self.check_force_join(user.id, context):
@@ -1074,7 +1282,6 @@ Welcome <b>{user.first_name}</b>!
             )
             return
         
-        # Send initial status message
         status_msg = await update.message.reply_text(
             f"🔄 <b>Checking {len(watchlist)} accounts with 10-second delays...</b>\n\nThis will take approximately {len(watchlist) * 10} seconds.",
             parse_mode=ParseMode.HTML
@@ -1088,7 +1295,6 @@ Welcome <b>{user.first_name}</b>!
         for username in watchlist:
             current += 1
             try:
-                # Update progress
                 await status_msg.edit_text(
                     f"🔄 <b>Checking accounts... ({current}/{len(watchlist)})</b>\n\n"
                     f"Currently checking: @{username}\n"
@@ -1096,7 +1302,6 @@ Welcome <b>{user.first_name}</b>!
                     parse_mode=ParseMode.HTML
                 )
                 
-                # Check username
                 status, details, profile_pic = await self.api_client.check_username(username)
                 
                 if status == 'ACTIVE':
@@ -1104,12 +1309,10 @@ Welcome <b>{user.first_name}</b>!
                 elif status == 'BANNED':
                     banned_count += 1
                 
-                # Format the result
                 result = self.format_account_info(username, status, details)
                 result += f"\n━━━━━━━━━━━━━━━━━━━━━\n"
                 all_results.append(result)
                 
-                # 10-second delay between checks (except for last one)
                 if current < len(watchlist):
                     await asyncio.sleep(Config.STATUS_DELAY)
                 
@@ -1118,7 +1321,6 @@ Welcome <b>{user.first_name}</b>!
                 all_results.append(self.format_account_info(username, 'UNKNOWN', {}))
                 all_results.append(f"\n━━━━━━━━━━━━━━━━━━━━━\n")
         
-        # Combine all results
         header = f"""
 <b>📊 STATUS CHECK RESULTS</b>
 
@@ -1137,9 +1339,7 @@ Welcome <b>{user.first_name}</b>!
         keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Split message if too long
         if len(final_message) > 4096:
-            # Send in parts
             await status_msg.delete()
             
             parts = [final_message[i:i+4096] for i in range(0, len(final_message), 4096)]
@@ -1160,7 +1360,6 @@ Welcome <b>{user.first_name}</b>!
             )
     
     async def check_command_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Prompt for username to check"""
         keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -1186,7 +1385,6 @@ Or use the command:
             )
     
     async def check_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /check command with profile picture"""
         user = update.effective_user
         
         if not await self.check_force_join(user.id, context):
@@ -1206,40 +1404,30 @@ Or use the command:
         )
         
         try:
-            # Check username
             status, details, profile_pic = await self.api_client.check_username(username)
             
-            # Format response
             response_text = self.format_account_info(username, status, details)
             response_text += "\nPowered by @proxyfxc"
             
-            # Send with profile picture if available
+            keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
             if status == 'ACTIVE' and profile_pic:
                 try:
-                    # Download the profile picture
                     async with aiohttp.ClientSession() as session:
                         async with session.get(profile_pic) as resp:
                             if resp.status == 200:
                                 photo_data = await resp.read()
-                                
-                                # Send photo with caption
                                 await status_msg.delete()
                                 await update.message.reply_photo(
                                     photo=photo_data,
                                     caption=response_text,
                                     parse_mode=ParseMode.HTML,
-                                    reply_markup=InlineKeyboardMarkup([[
-                                        InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")
-                                    ]])
+                                    reply_markup=reply_markup
                                 )
                                 return
                 except Exception as e:
                     logger.error(f"Error downloading profile picture: {e}")
-                    # Fall back to text message
-            
-            # If no profile picture or download failed, send text message
-            keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
             
             await status_msg.edit_text(
                 response_text,
@@ -1255,7 +1443,6 @@ Or use the command:
             )
     
     async def addwatch_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Prompt for username to add to watchlist"""
         keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -1280,10 +1467,7 @@ Or use the command:
                 reply_markup=reply_markup
             )
     
-    # ===== MODIFIED ADDWATCH COMMAND WITH DETAILS =====
-    
     async def addwatch_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /addwatch command with detailed response"""
         user = update.effective_user
         
         if not await self.check_force_join(user.id, context):
@@ -1297,7 +1481,7 @@ Or use the command:
             )
             return
         
-        current_count = len(self.db.get_watchlist(user.id))
+        current_count = self.db.get_watchlist_count(user.id)
         limit = self.get_user_limit(user.id)
         
         if current_count >= limit and limit != float('inf'):
@@ -1315,7 +1499,6 @@ Or use the command:
         username = args[0].lower().strip().lstrip('@')
         
         if username in self.db.get_watchlist(user.id):
-            # Already in watchlist - show current status
             status_msg = await update.message.reply_text(
                 f"🔍 <b>Checking @{username}...</b>",
                 parse_mode=ParseMode.HTML
@@ -1336,33 +1519,27 @@ Or use the command:
             )
             return
         
-        # Add to watchlist
         self.db.add_to_watchlist(user.id, username)
         
-        # Show checking message
         status_msg = await update.message.reply_text(
             f"🔍 <b>Fetching details for @{username}...</b>",
             parse_mode=ParseMode.HTML
         )
         
-        # Get current status
         status, details, profile_pic = await self.api_client.check_username(username)
         
-        # Format detailed response
         new_count = current_count + 1
         response_text = self.format_add_watch_details(username, status, details, new_count, limit)
         
         keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Send with profile picture if available
         if status == 'ACTIVE' and profile_pic:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(profile_pic) as resp:
                         if resp.status == 200:
                             photo_data = await resp.read()
-                            
                             await status_msg.delete()
                             await update.message.reply_photo(
                                 photo=photo_data,
@@ -1374,7 +1551,6 @@ Or use the command:
             except Exception as e:
                 logger.error(f"Error downloading profile picture: {e}")
         
-        # Fallback to text message
         await status_msg.edit_text(
             response_text,
             parse_mode=ParseMode.HTML,
@@ -1382,7 +1558,6 @@ Or use the command:
         )
     
     async def removewatch_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Prompt for username to remove from watchlist"""
         user = update.effective_user
         watchlist = self.db.get_watchlist(user.id)
         
@@ -1415,7 +1590,6 @@ Send a username to remove:
             )
     
     async def removewatch_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /removewatch command"""
         user = update.effective_user
         
         if not await self.check_force_join(user.id, context):
@@ -1436,12 +1610,11 @@ Send a username to remove:
             )
         else:
             await update.message.reply_text(
-                f"❌ @{username} not found.",
+                f"❌ @{username} not found in watch list.",
                 parse_mode=ParseMode.HTML
             )
     
     async def addban_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Prompt for username to add to banlist"""
         keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -1463,7 +1636,6 @@ Send a username to add to ban list:
             )
     
     async def addban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /addban command"""
         user = update.effective_user
         
         if not await self.check_force_join(user.id, context):
@@ -1499,7 +1671,6 @@ Send a username to add to ban list:
         )
     
     async def removeban_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Prompt for username to remove from banlist"""
         user = update.effective_user
         banlist = self.db.get_banlist(user.id)
         
@@ -1532,7 +1703,6 @@ Send a username to remove:
             )
     
     async def removeban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /removeban command"""
         user = update.effective_user
         
         if not await self.check_force_join(user.id, context):
@@ -1553,14 +1723,11 @@ Send a username to remove:
             )
         else:
             await update.message.reply_text(
-                f"❌ @{username} not found.",
+                f"❌ @{username} not found in ban list.",
                 parse_mode=ParseMode.HTML
             )
     
-    # ===== ADMIN COMMANDS =====
-    
     async def approve_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /approve command"""
         user = update.effective_user
         
         if not self.is_admin(user.id):
@@ -1617,7 +1784,6 @@ Powered by @proxyfxc
                 pass
     
     async def addadmin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /addadmin command"""
         user = update.effective_user
         
         if not self.is_owner(user.id):
@@ -1651,7 +1817,6 @@ Powered by @proxyfxc
                 pass
     
     async def broadcast_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /broadcast command"""
         user = update.effective_user
         
         if not self.is_admin(user.id):
@@ -1673,10 +1838,10 @@ Powered by @proxyfxc
         total = len(users)
         success = 0
         
-        for user_id_str in users:
+        for user_data in users:
             try:
                 await context.bot.send_message(
-                    chat_id=int(user_id_str),
+                    chat_id=user_data['user_id'],
                     text=f"""
 📢 <b>BROADCAST MESSAGE</b>
 
@@ -1698,10 +1863,7 @@ Powered by @proxyfxc
             parse_mode=ParseMode.HTML
         )
     
-    # ===== CALLBACK HANDLER - ALL BUTTONS WORKING =====
-    
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle all button callbacks"""
         query = update.callback_query
         await query.answer()
         
@@ -1710,7 +1872,6 @@ Powered by @proxyfxc
         
         logger.info(f"Button clicked: {data} by user {user.id}")
         
-        # Handle verify join button
         if data == "verify_join":
             await query.edit_message_text(
                 "🔄 <b>Verifying your channel membership...</b>",
@@ -1718,10 +1879,8 @@ Powered by @proxyfxc
             )
             
             if await self.check_force_join(user.id, context):
-                # Success - show main menu
                 await self.show_main_menu(update, context)
             else:
-                # Failed - show channel button again
                 channel = Config.FORCE_JOIN_CHANNEL
                 keyboard = [
                     [InlineKeyboardButton(
@@ -1743,39 +1902,28 @@ Powered by @proxyfxc
                 )
             return
         
-        # Check force join for all other actions
         if not await self.check_force_join(user.id, context):
             await self.send_force_join_message(update, context)
             return
         
-        # Handle all menu buttons
         if data == "menu_main":
             await self.show_main_menu(update, context)
-        
         elif data == "menu_watch":
             await self.watch_command(update, context)
-        
         elif data == "menu_ban":
             await self.ban_command(update, context)
-        
         elif data == "menu_status":
             await self.status_command(update, context)
-        
         elif data == "menu_check":
             await self.check_command_prompt(update, context)
-        
         elif data == "menu_addwatch":
             await self.addwatch_prompt(update, context)
-        
         elif data == "menu_removewatch":
             await self.removewatch_prompt(update, context)
-        
         elif data == "menu_addban":
             await self.addban_prompt(update, context)
-        
         elif data == "menu_removeban":
             await self.removeban_prompt(update, context)
-        
         elif data == "menu_help":
             help_text = """
 <b>📚 HELP & SUPPORT</b>
@@ -1797,11 +1945,12 @@ Powered by @proxyfxc
 /addadmin [id]
 
 <b>📊 How It Works:</b>
-• 5-minute monitoring
-• INSTANT notifications on status change
+• 10-minute monitoring
+• 2-STEP VERIFICATION (2 min wait)
 • Auto move between lists
 • Profile pictures in alerts
-• Detailed info when adding accounts
+• Detailed info when adding
+• PERSISTENT MONGODB STORAGE
 ━━━━━━━━━━━━━━━━━━━━━
 
 <i>Powered by @proxyfxc</i>
@@ -1814,17 +1963,21 @@ Powered by @proxyfxc
                 parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup
             )
-        
         elif data == "menu_admin" and self.is_admin(user.id):
+            total_watch = self.db.get_total_watchlist_count()
+            total_ban = self.db.get_total_banlist_count()
+            users = self.db.get_all_users()
+            
             admin_text = f"""
 <b>⚙️ ADMIN PANEL</b>
 
 ━━━━━━━━━━━━━━━━━━━━━
 📊 <b>System Stats:</b>
-• Users: {len(self.db.get_all_users())}
-• Watchlist: {sum(len(items) for items in self.db.watchlist.values())}
-• Banlist: {sum(len(items) for items in self.db.banlist.values())}
-• Mode: <b>INSTANT NOTIFICATIONS</b>
+• Users: {len(users)}
+• Watchlist: {total_watch}
+• Banlist: {total_ban}
+• Mode: <b>2-STEP VERIFICATION</b>
+• Storage: <b>MONGODB PERSISTENT</b>
 
 ━━━━━━━━━━━━━━━━━━━━━
 <b>Commands:</b>
@@ -1852,20 +2005,22 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== MAIN APPLICATION ====================
 
-# Global variables
 db = None
 monitoring_engine = None
 api_client = None
 
 async def run_bot():
-    """Async function to run the bot"""
     global db, monitoring_engine, api_client
     
     try:
-        # Initialize database
-        db = DatabaseManager()
+        # Initialize MongoDB
+        db = MongoDBManager()
         
-        # Initialize API client (no need for params now)
+        if not db.db:
+            logger.error("Failed to connect to MongoDB. Exiting...")
+            return
+        
+        # Initialize API client
         api_client = InstagramAPIClient()
         
         # Create application
@@ -1915,20 +2070,21 @@ async def run_bot():
             drop_pending_updates=True
         )
         
-        logger.info("Bot is running! Single force join: @proxydominates")
-        logger.info("MODE: INSTANT NOTIFICATIONS on status change")
-        logger.info("FEATURE: Detailed info when adding to watchlist")
+        logger.info("✅ Bot is running! Single force join: @proxydominates")
+        logger.info("✅ MODE: 2-STEP VERIFICATION (10min checks)")
+        logger.info("✅ STORAGE: MONGODB PERSISTENT - Data safe on restart!")
         
-        # Keep running
         while True:
             await asyncio.sleep(3600)
             
     except Exception as e:
         logger.error(f"Error in run_bot: {e}")
         traceback.print_exc()
+    finally:
+        if db:
+            db.close()
 
 def main():
-    """Main entry point"""
     logger.info("Starting main function...")
     
     # Start Flask thread
@@ -1937,7 +2093,7 @@ def main():
     flask_thread.start()
     logger.info("Flask keep-alive started")
     
-    # Run bot with proper event loop
+    # Run bot
     try:
         asyncio.run(run_bot())
     except RuntimeError:
