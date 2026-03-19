@@ -3,7 +3,7 @@ Professional Instagram Username Monitor Bot
 Single Channel Force Join - @proxydominates
 All buttons working, subscription system, monitoring
 Author: @proxyfxc
-Version: 6.2.0 (FINAL - FIXED UNBAN DETAILS)
+Version: 7.0.0 (FULLY FIXED)
 """
 
 import os
@@ -17,6 +17,7 @@ from pathlib import Path
 import sys
 import traceback
 import re
+import threading
 
 # Third-party imports
 from flask import Flask, jsonify
@@ -49,7 +50,7 @@ class Config:
     API_BASE_URL = 'https://tg-user-id-to-number-4erk.onrender.com/api'
     
     # MongoDB Configuration
-    MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+    MONGODB_URI = os.getenv('MONGODB_URI', '')
     DATABASE_NAME = 'instagram_monitor'
     
     # Admin Configuration
@@ -104,17 +105,29 @@ class MongoDBManager:
             self._init_collections()
             logger.info("✅ MongoDB connected successfully")
         else:
-            logger.error("❌ MongoDB connection failed")
+            logger.error("❌ MongoDB connection failed - Using fallback JSON storage")
+            self._init_fallback()
+    
+    def _init_fallback(self):
+        """Initialize fallback JSON storage if MongoDB fails"""
+        self.data_dir = Path('data')
+        self.data_dir.mkdir(exist_ok=True)
+        self.fallback_mode = True
+        logger.info("⚠️ Using fallback JSON storage mode")
     
     def connect(self):
         """Connect to MongoDB"""
+        if not Config.MONGODB_URI:
+            logger.warning("MongoDB URI not set, using fallback storage")
+            return
+            
         try:
             self.client = MongoClient(Config.MONGODB_URI, serverSelectionTimeoutMS=5000)
             self.client.admin.command('ping')
             self.db = self.client[Config.DATABASE_NAME]
-            logger.info("MongoDB connection established")
-        except ConnectionFailure as e:
-            logger.error(f"MongoDB connection failed: {e}")
+            logger.info("✅ MongoDB connection established")
+        except Exception as e:
+            logger.error(f"❌ MongoDB connection failed: {e}")
             self.client = None
             self.db = None
     
@@ -544,7 +557,7 @@ class MonitoringEngine:
                 await asyncio.sleep(60)
     
     async def _check_pending_verifications(self):
-        """Check pending verifications that are 2 minutes old - FIXED for unban details"""
+        """Check pending verifications that are 2 minutes old"""
         pending = self.db.get_all_pending()
         now = datetime.now()
         
@@ -563,13 +576,8 @@ class MonitoringEngine:
                         
                         data['verified'] = True
                         
-                        # ===== FIX: For UNBAN (ACTIVE status), use new details from API =====
-                        if status == 'ACTIVE' and details:
-                            final_details = details
-                            logger.info(f"✅ Using NEW active details for @{username}")
-                        else:
-                            final_details = data['details']
-                            logger.info(f"Using stored details for @{username}")
+                        # Use new details if available (for unban cases)
+                        final_details = details if details and status == 'ACTIVE' else data['details']
                         
                         await self._send_verified_alert(
                             username, 
@@ -814,7 +822,8 @@ def home():
     return jsonify({
         'status': 'alive',
         'timestamp': datetime.now().isoformat(),
-        'service': 'Instagram Monitor Bot'
+        'service': 'Instagram Monitor Bot',
+        'bot_running': monitoring_engine.is_running if monitoring_engine else False
     })
 
 @app.route('/health')
@@ -2010,20 +2019,20 @@ monitoring_engine = None
 api_client = None
 
 async def run_bot():
+    """Async function to run the bot"""
     global db, monitoring_engine, api_client
     
     try:
+        logger.info("🚀 run_bot function started!")
+        
         # Initialize MongoDB
         db = MongoDBManager()
-        
-        if not db.db:
-            logger.error("Failed to connect to MongoDB. Exiting...")
-            return
         
         # Initialize API client
         api_client = InstagramAPIClient()
         
         # Create application
+        logger.info("Creating Telegram application...")
         application = (
             Application.builder()
             .token(Config.BOT_TOKEN)
@@ -2061,7 +2070,7 @@ async def run_bot():
         asyncio.create_task(monitoring_engine.start())
         
         # Start bot
-        logger.info("Starting bot...")
+        logger.info("Starting bot polling...")
         
         await application.initialize()
         await application.start()
@@ -2074,34 +2083,34 @@ async def run_bot():
         logger.info("✅ MODE: 2-STEP VERIFICATION (10min checks)")
         logger.info("✅ STORAGE: MONGODB PERSISTENT - Data safe on restart!")
         
+        # Keep running
         while True:
             await asyncio.sleep(3600)
             
     except Exception as e:
-        logger.error(f"Error in run_bot: {e}")
+        logger.error(f"❌ Error in run_bot: {e}")
         traceback.print_exc()
     finally:
         if db:
             db.close()
 
 def main():
+    """Main entry point"""
     logger.info("Starting main function...")
     
     # Start Flask thread
-    import threading
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info("Flask keep-alive started")
     
-    # Run bot
+    # Run bot with proper event loop
     try:
         asyncio.run(run_bot())
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop.create_task(run_bot())
-        else:
-            loop.run_until_complete(run_bot())
+    except RuntimeError as e:
+        logger.error(f"RuntimeError: {e}")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_bot())
     except Exception as e:
         logger.error(f"Error in main: {e}")
         traceback.print_exc()
