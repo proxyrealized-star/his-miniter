@@ -43,7 +43,7 @@ class Config:
     # Bot Configuration
     BOT_TOKEN = os.getenv('BOT_TOKEN', '7728850256:AAFhVPRzSANY905UESCad1al2RsJtqQDmCw')
     API_KEY = 'PAID_INSTA_SELL187'
-    API_BASE_URL = 'https://tg-user-id-to-number-4erk.onrender.com/api'
+    API_BASE_URL = 'https://tg-username-to-num.onrender.com/api'
     
     # Admin Configuration
     OWNER_IDS = [int(id) for id in os.getenv('OWNER_IDS', '7805871651').split(',')]
