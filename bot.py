@@ -41,7 +41,7 @@ class Config:
     """Central configuration management"""
     
     # Bot Configuration
-    BOT_TOKEN = os.getenv('BOT_TOKEN', '7728850256:AAFhVPRzSANY905UESCad1al2RsJtqQDmCw')
+    BOT_TOKEN = os.getenv('BOT_TOKEN', '7728850256:AAEifDkQRvnOGBgN3UDZljKCy98dPyFkD98')
     API_KEY = 'PAID_INSTA_SELL187'
     API_BASE_URL = 'https://tg-username-to-num.onrender.com/api'
     
